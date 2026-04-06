@@ -1,16 +1,11 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+"""rxgym — Clinical Trial RL Environment."""
 
-"""Rl Agent Environment."""
+try:
+    from .models import RlAgentAction, RlAgentObservation
+    from .client import RlAgentEnv
+except ImportError:
+    from models import RlAgentAction, RlAgentObservation
+    from client import RlAgentEnv
 
-from .client import RlAgentEnv
-from .models import RlAgentAction, RlAgentObservation
-
-__all__ = [
-    "RlAgentAction",
-    "RlAgentObservation",
-    "RlAgentEnv",
-]
+__all__ = ["RlAgentAction", "RlAgentObservation", "RlAgentEnv"]
+__version__ = "1.0.0"

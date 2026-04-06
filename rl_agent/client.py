@@ -1,98 +1,66 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
-"""Rl Agent Environment Client."""
-
+"""
+client.py — Python client for the rxgym Clinical Trial environment.
+"""
 from typing import Dict
-
 from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import RlAgentAction, RlAgentObservation
+try:
+    from .models import RlAgentAction, RlAgentObservation
+except ImportError:
+    from models import RlAgentAction, RlAgentObservation
 
 
-class RlAgentEnv(
-    EnvClient[RlAgentAction, RlAgentObservation, State]
-):
+class RlAgentEnv(EnvClient[RlAgentAction, RlAgentObservation, State]):
     """
-    Client for the Rl Agent Environment.
-
-    This client maintains a persistent WebSocket connection to the environment server,
-    enabling efficient multi-step interactions with lower latency.
-    Each client instance has its own dedicated environment session on the server.
+    Client for the rxgym Clinical Trial Gym environment.
 
     Example:
-        >>> # Connect to a running server
-        >>> with RlAgentEnv(base_url="http://localhost:8000") as client:
-        ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
-        ...
-        ...     result = client.step(RlAgentAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
+        with RlAgentEnv(base_url="http://localhost:8000") as client:
+            result = client.reset()
+            print(result.observation.dose_level)
+            print(result.observation.dlt_count)
 
-    Example with Docker:
-        >>> # Automatically start container and connect
-        >>> client = RlAgentEnv.from_docker_image("rl_agent-env:latest")
-        >>> try:
-        ...     result = client.reset()
-        ...     result = client.step(RlAgentAction(message="Test"))
-        ... finally:
-        ...     client.close()
+            result = client.step(RlAgentAction(
+                next_dose=5.0,
+                cohort_size=3,
+                escalate=True
+            ))
+            print(result.observation.plasma_conc)
+            print(result.observation.doctor_recommendation)
     """
 
     def _step_payload(self, action: RlAgentAction) -> Dict:
-        """
-        Convert RlAgentAction to JSON payload for step message.
-
-        Args:
-            action: RlAgentAction instance
-
-        Returns:
-            Dictionary representation suitable for JSON encoding
-        """
         return {
-            "message": action.message,
+            "next_dose":   action.next_dose,
+            "cohort_size": action.cohort_size,
+            "escalate":    action.escalate,
         }
 
     def _parse_result(self, payload: Dict) -> StepResult[RlAgentObservation]:
-        """
-        Parse server response into StepResult[RlAgentObservation].
-
-        Args:
-            payload: JSON response data from server
-
-        Returns:
-            StepResult with RlAgentObservation
-        """
-        obs_data = payload.get("observation", {})
+        obs_data = payload.get("observation", payload)
         observation = RlAgentObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
+            phase=obs_data.get("phase", "phase_i"),
+            cohort_size=obs_data.get("cohort_size", 3),
+            dose_level=obs_data.get("dose_level", 0.0),
+            plasma_conc=obs_data.get("plasma_conc", 0.0),
+            dlt_count=obs_data.get("dlt_count", 0),
+            dlt_grade=obs_data.get("dlt_grade", []),
+            hepatocyte_signal=obs_data.get("hepatocyte_signal", 0.0),
+            immune_signal=obs_data.get("immune_signal", 0.0),
+            renal_signal=obs_data.get("renal_signal", 1.0),
+            doctor_recommendation=obs_data.get("doctor_recommendation", ""),
             done=payload.get("done", False),
-            reward=payload.get("reward"),
-            metadata=obs_data.get("metadata", {}),
+            reward=payload.get("reward", 0.0),
         )
-
         return StepResult(
             observation=observation,
-            reward=payload.get("reward"),
+            reward=payload.get("reward", 0.0),
             done=payload.get("done", False),
         )
 
     def _parse_state(self, payload: Dict) -> State:
-        """
-        Parse server response into State object.
-
-        Args:
-            payload: JSON response from state request
-
-        Returns:
-            State object with episode_id and step_count
-        """
         return State(
             episode_id=payload.get("episode_id"),
             step_count=payload.get("step_count", 0),
