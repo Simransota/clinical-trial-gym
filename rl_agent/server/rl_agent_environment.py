@@ -6,19 +6,19 @@ Simulates Phase I drug dose escalation trials.
 Wires together all agents and exposes step/reset/state API.
 
 Fixes applied vs original:
-  [Bug 5] _compute_reward: history[-2] was reading the wrong step because
-          the current step hadn't been appended yet. Fixed by appending to
-          history BEFORE calling _compute_reward, and passing prev_dose
-          explicitly so the reward function doesn't index history directly.
-  [Bug 6] "escalate" key was never saved in the history dict, so the
-          voluntary-stop reward branch could never fire. Added "escalate"
-          to every history entry.
-  [Bug 7] _grade_allometric exponent clarified to -0.25 (was written as
-          the expression 0.75 - 1.0 which was opaque and misleading).
+  [Bug 5] _compute_reward: history[-2] was reading two steps ago because
+          the current step was not yet in history when reward was computed.
+          Fix: history is now appended BEFORE _compute_reward is called,
+          and reward is recomputed/stored after. prev_dose is passed
+          explicitly to avoid indexing confusion.
+  [Bug 6] stopping reward branch could never fire because "escalate" was
+          never saved in the history dict. Fix: action.escalate is now
+          saved to history so the stopping component works correctly.
+  [Bug 7] _grade_allometric: exponent written as (0.75 - 1.0) was opaque
+          and could confuse maintainers. Rewritten as the explicit
+          allometric formula with clear variable names.
 """
 
-import sys
-import os
 import random
 import numpy as np
 from uuid import uuid4
@@ -33,32 +33,23 @@ except ImportError:
 
 try:
     from .agents import (
-        PatientAgent,
-        HepatocyteAgent,
-        ImmuneAgent,
-        RenalAgent,
-        MeasurementAgent,
-        DoctorAgent,
+        PatientAgent, HepatocyteAgent, ImmuneAgent,
+        RenalAgent, MeasurementAgent, DoctorAgent,
     )
 except ImportError:
     from agents import (
-        PatientAgent,
-        HepatocyteAgent,
-        ImmuneAgent,
-        RenalAgent,
-        MeasurementAgent,
-        DoctorAgent,
+        PatientAgent, HepatocyteAgent, ImmuneAgent,
+        RenalAgent, MeasurementAgent, DoctorAgent,
     )
 
 
 # ── FDA trial rules ──────────────────────────────────────────────────────────
-TRUE_RP2D = 12.0   # mg/kg — the "correct answer" the agent is trying to find
-                   # hidden from agent, used only by grader
+TRUE_RP2D = 12.0   # mg/kg — the correct answer; hidden from agent, used by grader
 
 FDA_RULES = {
-    "max_dlt_rate":   0.33,   # stop if >33% of cohort has Grade 3+ side effects
-    "max_steps":      10,     # maximum dose escalation steps per episode
-    "max_dose_mg_kg": 50.0,   # absolute dose ceiling
+    "max_dlt_rate":   0.33,
+    "max_steps":      10,
+    "max_dose_mg_kg": 50.0,
 }
 
 
@@ -71,29 +62,29 @@ class RlAgentEnvironment(Environment):
     The agent:
       - Sees: plasma concentration, DLT counts, organ signals, doctor advice
       - Does: choose next dose, cohort size, whether to escalate
-      - Goal: find the RP2D (right dose) as safely and quickly as possible
+      - Goal: find the RP2D as safely and quickly as possible
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
     def __init__(self):
-        self._state = State(episode_id=str(uuid4()), step_count=0)
-        self.cohort = []
+        self._state    = State(episode_id=str(uuid4()), step_count=0)
+        self.cohort    = []
         self.current_dose = 1.0
-        self.history = []
+        self.history   = []
         self.rp2d_dose = None
-        self._done = False
-        self._use_llm = True
-        self.doctor = DoctorAgent() if self._use_llm else None
+        self._done     = False
+        self._use_llm  = True
+        self.doctor    = DoctorAgent() if self._use_llm else None
 
     # ── reset() ─────────────────────────────────────────────────────────────
     def reset(self) -> RlAgentObservation:
         """Start a fresh trial episode."""
-        self._state = State(episode_id=str(uuid4()), step_count=0)
+        self._state       = State(episode_id=str(uuid4()), step_count=0)
         self.current_dose = 1.0
-        self.history = []
-        self.rp2d_dose = None
-        self._done = False
+        self.history      = []
+        self.rp2d_dose    = None
+        self._done        = False
 
         self.cohort = self._make_cohort(3)
         self._run_cohort(self.current_dose)
@@ -121,25 +112,24 @@ class RlAgentEnvironment(Environment):
         """
         self._state.step_count += 1
 
-        # 1. Capture previous dose BEFORE updating (used by reward function)
+        # 1. Record previous dose BEFORE updating (used by reward function)
         prev_dose = self.current_dose
 
-        # 2. Apply dose (clamp to safe range)
+        # 2. Apply dose (clamped to safe range)
         self.current_dose = max(0.1, min(action.next_dose, FDA_RULES["max_dose_mg_kg"]))
-        cohort_n = max(3, min(action.cohort_size, 6))
+        cohort_n          = max(3, min(action.cohort_size, 6))
 
         # 3. Make new cohort and run simulation
         self.cohort = self._make_cohort(cohort_n)
         self._run_cohort(self.current_dose)
 
         # 4. Read biological signals from each patient
-        states = [p.get_state() for p in self.cohort]
-
+        states      = [p.get_state() for p in self.cohort]
         dlt_grades  = [MeasurementAgent.grade_dlt(s) for s in states]
-        hep_signals = [HepatocyteAgent.observe(s)    for s in states]
-        imm_signals = [ImmuneAgent.observe(s)         for s in states]
-        ren_signals = [RenalAgent.observe(s)           for s in states]
-        cmax_vals   = [p.blood_conc                   for p in self.cohort]
+        hep_signals = [HepatocyteAgent.observe(s)     for s in states]
+        imm_signals = [ImmuneAgent.observe(s)          for s in states]
+        ren_signals = [RenalAgent.observe(s)            for s in states]
+        cmax_vals   = [p.blood_conc                    for p in self.cohort]
 
         dlt_count = sum(1 for g in dlt_grades if g >= 3)
         avg_hep   = float(np.mean(hep_signals))
@@ -158,7 +148,33 @@ class RlAgentEnvironment(Environment):
 
         self._done = fda_stop or agent_stopped or max_steps_hit
 
-        # 6. Doctor recommendation
+        # 6. Save to history BEFORE computing reward
+        #    FIX [Bug 5]: history must be populated first so _compute_reward
+        #    can read history[-1] as the current step and history[-2] as the
+        #    actual previous step.
+        #    FIX [Bug 6]: "escalate" is now saved so stopping reward fires.
+        self.history.append({
+            "step":        self._state.step_count,
+            "dose":        self.current_dose,
+            "dlt_count":   dlt_count,
+            "dlt_rate":    dlt_rate,
+            "cohort_size": len(self.cohort),
+            "escalate":    action.escalate,   # FIX [Bug 6]
+            "reward":      0.0,               # placeholder; filled below
+        })
+
+        # 7. Compute reward (now history[-1] is the current step)
+        reward = self._compute_reward(
+            dlt_count=dlt_count,
+            cohort_size=len(self.cohort),
+            fda_stop=fda_stop,
+            avg_hep=avg_hep,
+            avg_ren=avg_ren,
+            prev_dose=prev_dose,              # FIX [Bug 5]: passed explicitly
+        )
+        self.history[-1]["reward"] = reward   # back-fill the placeholder
+
+        # 8. Doctor recommendation
         if self._use_llm and self.doctor:
             rec = self.doctor.recommend(
                 cmax=avg_cmax,
@@ -180,34 +196,6 @@ class RlAgentEnvironment(Environment):
                 rec = "ESCALATE: Safety signals within acceptable limits."
             else:
                 rec = "HOLD: Borderline safety signals, monitor before escalating."
-
-        # 7. FIX [Bug 5 & 6]: append history BEFORE computing reward,
-        #    and include "escalate" so the stopping component can read it.
-        prev_dlt_count = self.history[-1]["dlt_count"] if self.history else 0
-        self.history.append({
-            "step":        self._state.step_count,
-            "dose":        self.current_dose,
-            "dlt_count":   dlt_count,
-            "dlt_rate":    dlt_rate,
-            "cohort_size": len(self.cohort),
-            "escalate":    action.escalate,   # FIX [Bug 6]: was missing
-        })
-
-        # 8. Compute reward — now receives prev_dose explicitly so it never
-        #    needs to index history[-2] itself.
-        reward = self._compute_reward(
-            dlt_count=dlt_count,
-            cohort_size=len(self.cohort),
-            fda_stop=fda_stop,
-            avg_hep=avg_hep,
-            avg_ren=avg_ren,
-            prev_dose=prev_dose,              # FIX [Bug 5]: explicit arg
-            prev_dlt_count=prev_dlt_count,    # FIX [Bug 5]: explicit arg
-            agent_escalate=action.escalate,
-        )
-
-        # 9. Save reward back into the history entry now that it's computed
-        self.history[-1]["reward"] = reward
 
         return RlAgentObservation(
             phase="phase_i",
@@ -232,6 +220,7 @@ class RlAgentEnvironment(Environment):
     # ── graders ─────────────────────────────────────────────────────────────
 
     def grade_episode(self, task: str = "phase_i_dosing") -> float:
+        """Score the full episode 0.0 to 1.0. Called by inference.py."""
         if task == "phase_i_dosing":
             return self._grade_phase_i()
         elif task == "allometric_scaling":
@@ -255,15 +244,25 @@ class RlAgentEnvironment(Environment):
         return round(max(0.0, min(1.0, dose_score - penalty + bonus)), 3)
 
     def _grade_allometric(self) -> float:
+        """
+        FIX [Bug 7]: formula rewritten with explicit variable names.
+
+        Allometric scaling from rat (0.25 kg) to human (70 kg):
+          human_dose = rat_dose * (human_weight / rat_weight) ^ (exponent - 1)
+        where exponent = 0.75 (standard allometric exponent for clearance).
+        """
         if not self.history:
             return 0.0
         proposed = self.history[0]["dose"]
-        # FIX [Bug 7]: exponent written explicitly as -0.25 (allometric scaling
-        # exponent for clearance: CL_human = CL_rat * (BW_human/BW_rat)^0.75,
-        # so starting dose = rat_dose * (BW_rat/BW_human)^0.25 = rat_dose * ratio^-0.25)
-        rat_dose_mg_kg = 8.0
-        bw_ratio = 70.0 / 0.25   # human_kg / rat_kg
-        human_equivalent = rat_dose_mg_kg * (bw_ratio ** -0.25)  # ≈ 1.9 mg/kg
+
+        rat_dose      = 8.0    # mg/kg in rat
+        rat_weight    = 0.25   # kg
+        human_weight  = 70.0   # kg
+        allometric_exp = 0.75  # standard clearance scaling exponent
+
+        # Human equivalent dose via allometric scaling
+        human_equivalent = rat_dose * (human_weight / rat_weight) ** (allometric_exp - 1.0)
+
         error = abs(proposed - human_equivalent) / max(human_equivalent, 0.01)
         if   error <= 0.10: return 1.0
         elif error <= 0.25: return 0.8
@@ -309,17 +308,19 @@ class RlAgentEnvironment(Environment):
         fda_stop: bool,
         avg_hep: float,
         avg_ren: float,
-        prev_dose: float,       # FIX [Bug 5]: passed explicitly, not read from history
-        prev_dlt_count: int,    # FIX [Bug 5]: passed explicitly, not read from history
-        agent_escalate: bool,   # FIX [Bug 6]: passed directly from action
+        prev_dose: float,   # FIX [Bug 5]: explicitly passed, not inferred from history
     ) -> float:
         """
-        Reward function shaped by observable signals only.
-        No hidden RP2D comparison. Rewards the agent for:
-          1. Keeping patients safe (no DLTs)           — 40%
-          2. Making escalation progress when safe       — 35%
-          3. Stopping at the right time                 — 15%
-          4. Maintaining organ health throughout        — 10%
+        Shaped reward function — observable signals only, no hidden RP2D.
+
+        Components:
+          40% — Safety        (no DLTs, no FDA violation)
+          35% — Progress      (escalate when safe, de-escalate when not)
+          15% — Stopping      (voluntary stop at right moment)
+          10% — Organ health  (kidney + liver throughout)
+
+        Called AFTER the current step has been appended to self.history,
+        so history[-1] is the current step and history[-2] is the previous.
         """
         dlt_rate = dlt_count / max(cohort_size, 1)
 
@@ -336,31 +337,33 @@ class RlAgentEnvironment(Environment):
             safety = 0.0
 
         # ── Component 2: Escalation progress (35%) ────────────────────────────
-        # FIX [Bug 5]: uses prev_dose argument instead of history[-2]["dose"]
+        # FIX [Bug 5]: use prev_dose (passed explicitly) instead of
+        # history[-2] which was off-by-one in the original.
         if dlt_rate == 0 and avg_hep < 0.5 and avg_ren > 0.7:
             if self.current_dose > prev_dose:
                 progress = min(1.0, self.current_dose / 20.0)
             else:
                 progress = 0.3
         elif dlt_rate > 0 and self.current_dose <= prev_dose:
-            # DLTs appeared AND agent de-escalated — correct behavior
+            # DLTs appeared AND agent de-escalated — correct behaviour
             progress = 0.7
         elif dlt_rate > 0:
-            # DLTs appeared but agent kept escalating — penalize
+            # DLTs appeared but agent kept pushing — penalise
             progress = 0.1
         else:
             progress = 0.5
 
-        # ── Component 3: Stopping behavior (15%) ─────────────────────────────
-        # FIX [Bug 6]: uses agent_escalate argument instead of history[-1].get("escalate")
+        # ── Component 3: Stopping behaviour (15%) ─────────────────────────────
+        # FIX [Bug 6]: history[-1]["escalate"] now exists (was always missing
+        # before), so this branch can actually fire.
         if fda_stop:
             stopping = 0.0
-        elif not agent_escalate:
+        elif not self.history[-1].get("escalate", True):
             # Agent voluntarily stopped
             if dlt_rate > 0 and self.current_dose > 3.0:
-                stopping = 1.0    # stopped when DLTs appeared at meaningful dose
+                stopping = 1.0    # stopped right when DLTs appeared
             elif dlt_rate == 0 and self.current_dose > 8.0:
-                stopping = 0.7    # stopped conservatively at a reasonable dose
+                stopping = 0.7    # conservative stop at meaningful dose
             else:
                 stopping = 0.3    # stopped too early
         else:
@@ -377,10 +380,12 @@ class RlAgentEnvironment(Environment):
             0.10 * organ
         )
 
-        # ── RP2D transition bonus ─────────────────────────────────────────────
-        # FIX [Bug 5]: uses prev_dlt_count argument instead of history[-2]["dlt_count"]
-        if dlt_rate > 0 and prev_dlt_count == 0:
-            # This is the exact transition step — DLTs just appeared for the first time
-            value = min(1.0, value + 0.15)
+        # ── RP2D transition bonus ──────────────────────────────────────────────
+        # Extra reward for the exact step where DLTs first appear after safe
+        # escalation (the transition point that identifies the RP2D).
+        if dlt_rate > 0 and len(self.history) >= 2:
+            prev_dlt = self.history[-2].get("dlt_count", 0)
+            if prev_dlt == 0:
+                value = min(1.0, value + 0.15)
 
         return round(min(1.0, max(0.0, value)), 3)
