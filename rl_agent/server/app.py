@@ -30,7 +30,7 @@ Usage:
 
 from dotenv import load_dotenv
 load_dotenv()
-
+from fastapi import Request
 try:
     from openenv.core.env_server.http_server import create_app
 except Exception as e:  # pragma: no cover
@@ -55,6 +55,13 @@ app = create_app(
     max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
 )
 
+# app.py — add this after create_app(...)
+
+@app.get("/episode_data")
+def get_episode_data():
+    """Return full episode data for Layer 5 visualization."""
+    env_instance = app.state.env   # openenv stores the env here
+    return env_instance.get_episode_data()
 
 def main(host: str = "0.0.0.0", port: int = 8000):
     """

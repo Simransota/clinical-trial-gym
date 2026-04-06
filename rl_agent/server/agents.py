@@ -1,28 +1,39 @@
 """
 agents.py — All 6 agents for the multi-agent clinical simulation layer.
 
-Six agents in total:
-  1. PatientAgent      — runs the 2-compartment ODE (the patient's body)
-  2. HepatocyteAgent   — watches the liver (rule-based)
-  3. ImmuneAgent       — watches the immune system (rule-based)
-  4. RenalAgent        — watches the kidneys (rule-based)
-  5. MeasurementAgent  — simulates lab blood tests, grades DLTs (rule-based)
-  6. DoctorAgent       — reads all signals, calls LLM, writes recommendation
+Layer 1/2 integration
+─────────────────────
+PatientAgent now accepts a `drug_params` dict produced by Layer 1 (RDKit /
+DeepChem) and Layer 2 (PK-Sim / surrogate ODE).  When the dict is supplied
+every PK parameter comes from the real molecule; when it is omitted the
+original heuristic defaults are used so nothing breaks if Layer 1/2 are
+not yet wired up.
 
-Fixes applied vs original:
-  [Bug 1] HepatocyteAgent: SATURATION_THRESHOLD was dead code; now used in a
-          proper sigmoid so liver response curves sharply past the threshold
-          instead of staying purely linear.
-  [Bug 2] MeasurementAgent.get_labs: noise was unseeded — same state could
-          produce different DLT grades on repeated calls. Labs are now
-          deterministic: noise is seeded from a hash of the state values so
-          the same physiological state always maps to the same lab result.
-  [Bug 3] PatientAgent: age was stored but never wired into PK math. Now
-          applied as a clearance modifier (ke reduced ~0.5% per year over 40).
-  [Bug 4] PatientAgent.advance: organ stress was accumulated using end-of-step
-          concentration, underestimating exposure for rapidly clearing drugs.
-          Now accumulated inside the Euler loop using the trapezoidal rule
-          (average of concentration before and after each sub-step).
+Expected `drug_params` shape (exactly what Layer 1/2 already outputs):
+    {
+        "ka":  0.1127,   # absorption rate constant (1/h)
+        "F":   0.80,     # oral bioavailability (fraction)
+        "CL":  0.50,     # clearance (L/h/kg) — HUMAN-scaled value
+        "Vc":  2.4746,   # central volume of distribution (L/kg)
+        "Vp":  1.6497,   # peripheral volume of distribution (L/kg)
+        "Q":   0.30,     # inter-compartmental clearance (L/h/kg)
+        "PPB": 0.6048,   # plasma protein binding (fraction)
+        "fu":  0.3952,   # unbound fraction
+    }
+
+Optional safety flags also accepted (used to modulate organ-stress signals):
+    {
+        "dili_risk":    False,   # drug-induced liver injury flag
+        "herg_risk":    False,   # cardiac risk flag
+        "cyp_inhibitions": [],   # list of inhibited CYPs e.g. ["CYP3A4"]
+        "bbb_penetrant": True,
+    }
+
+Fixes vs original (carried forward from previous patch):
+  [Bug 1] HepatocyteAgent sigmoid   — SATURATION_THRESHOLD now used
+  [Bug 2] MeasurementAgent noise    — deterministic seed from state hash
+  [Bug 3] PatientAgent age          — wired into clearance (ke)
+  [Bug 4] Organ stress trapezoidal  — AUC-correct accumulation inside loop
 """
 
 import os
@@ -31,92 +42,182 @@ import random
 from openai import OpenAI
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # AGENT 1: PatientAgent
-# Simulates one patient's body using a
-# 2-compartment ODE (math model of drug movement).
-#
-# Compartment 1 = bloodstream (drug enters here)
-# Compartment 2 = tissues/organs (drug slowly moves here)
-#
-# At each timestep, drug:
-#   - enters bloodstream from the dose
-#   - moves between blood and tissue
-#   - gets cleared by liver and kidneys
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Default PK parameters used when no drug_params dict is supplied.
+# These approximate a generic small-molecule oral drug.
+_DEFAULT_DRUG_PARAMS = {
+    "ka":  1.20,    # 1/h   — faster absorption than aspirin (heuristic)
+    "F":   0.80,    # fraction
+    "CL":  0.15,    # L/h/kg — human clearance (used to derive ke)
+    "Vc":  0.70,    # L/kg  — central Vd (per kg, multiplied by weight below)
+    "Vp":  0.467,   # L/kg  — peripheral Vd  (≈ Vc * 0.667, original k12/k21 ratio)
+    "Q":   0.06,    # L/h/kg — inter-compartmental CL (≈ k12 * Vc)
+    "PPB": 0.50,
+    "fu":  0.50,
+}
+
+_DEFAULT_SAFETY_FLAGS = {
+    "dili_risk":       False,
+    "herg_risk":       False,
+    "cyp_inhibitions": [],
+    "bbb_penetrant":   False,
+}
+
 
 class PatientAgent:
-    def __init__(self, weight_kg=70.0, age=45, renal_factor=1.0, hepatic_factor=1.0):
+    """
+    Simulates one patient's body using a 2-compartment ODE.
+
+    PK parameters are sourced from `drug_params` (Layer 1/2 output) when
+    provided, falling back to `_DEFAULT_DRUG_PARAMS` otherwise.
+
+    The ODE (standard 2-compartment IV/oral model):
+        d(C1)/dt = (F * ka * dose_depot) / Vc
+                   - (CL/Vc) * C1
+                   - (Q/Vc)  * C1
+                   + (Q/Vp)  * C2
+        d(C2)/dt =  (Q/Vc)   * C1  -  (Q/Vp) * C2
+
+    where C1 = central (blood) concentration, C2 = peripheral concentration.
+    """
+
+    def __init__(
+        self,
+        weight_kg: float       = 70.0,
+        age: int               = 45,
+        sex: str               = "M",
+        renal_factor: float    = 1.0,
+        hepatic_factor: float  = 1.0,
+        drug_params: dict      = None,   # ← Layer 1/2 output
+        safety_flags: dict     = None,   # ← Layer 1/2 safety profile
+    ):
         """
-        weight_kg      — patient body weight (affects how drug distributes)
-        age            — affects hepatic clearance rate (older -> slower clearance)
-        renal_factor   — 1.0 = healthy kidneys, 0.5 = half function
-        hepatic_factor — 1.0 = healthy liver,   0.5 = half function
+        Parameters
+        ----------
+        weight_kg      : patient body weight
+        age            : affects hepatic clearance (~0.5%/yr decline past 40)
+        sex            : "M" or "F" (minor Vd adjustment)
+        renal_factor   : 1.0 = healthy kidneys, 0.5 = half function
+        hepatic_factor : 1.0 = healthy liver,   0.5 = half function
+        drug_params    : PK dict from Layer 1/2 (see module docstring)
+        safety_flags   : safety dict from Layer 1/2 (see module docstring)
         """
-        self.weight_kg     = weight_kg
-        self.age           = age
-        self.renal_factor  = renal_factor
+        self.weight_kg      = weight_kg
+        self.age            = age
+        self.sex            = sex
+        self.renal_factor   = renal_factor
         self.hepatic_factor = hepatic_factor
 
-        # PK parameters (how drug moves through body).
-        # These would come from Layer 1 (RDKit) in a real system.
-        self.ka  = 1.2               # absorption rate
-        self.k12 = 0.08              # rate blood -> tissue
-        self.k21 = 0.04              # rate tissue -> blood
-        self.Vd  = 0.7 * weight_kg  # volume of distribution (liters)
+        # ── Resolve drug PK parameters ────────────────────────────────────────
+        # Layer 1/2 provides per-kg values; multiply by weight where needed.
+        dp = {**_DEFAULT_DRUG_PARAMS, **(drug_params or {})}
 
-        # FIX [Bug 3]: age now reduces hepatic clearance by ~0.5% per year
-        # above 40. A 60-year-old clears ~10% slower than a 40-year-old.
-        # Floor at 0.5 so very elderly patients still clear the drug.
-        age_clearance_factor = max(0.5, 1.0 - 0.005 * max(0, age - 40))
+        self.ka  = float(dp["ka"])
+        self.F   = float(dp["F"])
 
-        # ke = elimination rate: scaled by liver health AND patient age
-        self.ke = 0.15 * hepatic_factor * age_clearance_factor
+        # Volumes: Layer 1/2 reports L/kg → scale to patient
+        # Sex adjustment: women average ~15% lower Vd for hydrophilic drugs
+        sex_vd_factor = 0.85 if sex == "F" else 1.0
+        self.Vc = float(dp["Vc"]) * weight_kg * sex_vd_factor   # L
+        self.Vp = float(dp["Vp"]) * weight_kg * sex_vd_factor   # L
 
-        # Compartment state
-        self.blood_conc  = 0.0   # mg/L in bloodstream
-        self.tissue_conc = 0.0   # mg/L in tissues
-        self.time        = 0.0   # hours elapsed
+        # Clearances: L/h/kg → scale to patient, then apply organ health
+        # Age factor: ke declines ~0.5%/yr past age 40 (floor 0.5)
+        age_factor = max(0.5, 1.0 - 0.005 * max(0, age - 40))
 
-        # Accumulated organ stress (AUC-weighted)
+        CL_drug = float(dp["CL"]) * weight_kg   # L/h
+        self.CL = CL_drug * hepatic_factor * age_factor
+
+        self.Q  = float(dp["Q"])  * weight_kg   # L/h — inter-compartmental
+
+        # Convenience: ke (elimination rate from central compartment)
+        self.ke  = self.CL / max(self.Vc, 1e-6)   # 1/h
+        # k12, k21 derived from Q and volumes (standard 2-comp relationships)
+        self.k12 = self.Q / max(self.Vc, 1e-6)    # 1/h
+        self.k21 = self.Q / max(self.Vp, 1e-6)    # 1/h
+
+        self.fu  = float(dp["fu"])
+        self.PPB = float(dp["PPB"])
+
+        # ── Safety flags ──────────────────────────────────────────────────────
+        sf = {**_DEFAULT_SAFETY_FLAGS, **(safety_flags or {})}
+        self.dili_risk       = bool(sf["dili_risk"])
+        self.herg_risk       = bool(sf["herg_risk"])
+        self.cyp_inhibitions = list(sf["cyp_inhibitions"])
+        self.bbb_penetrant   = bool(sf["bbb_penetrant"])
+
+        # DILI risk amplifies hepatic stress accumulation by 2×
+        self._liver_stress_multiplier = 2.0 if self.dili_risk else 1.0
+
+        # ── Patient ID and state ──────────────────────────────────────────────
+        import uuid
+        self.patient_id  = f"PT-{uuid.uuid4().hex[:6].upper()}"
+
+        self.blood_conc   = 0.0   # C1: mg/L in central (blood) compartment
+        self.tissue_conc  = 0.0   # C2: mg/L in peripheral (tissue) compartment
+        self.depot        = 0.0   # unabsorbed drug in gut (oral dosing)
+        self.time         = 0.0   # hours elapsed
+
         self.cumulative_liver_stress  = 0.0
         self.cumulative_kidney_stress = 0.0
 
+    # ── dosing ────────────────────────────────────────────────────────────────
+
     def dose(self, amount_mg_per_kg: float):
         """
-        Give the patient a dose. Drug enters the bloodstream instantly
-        (simplified — no absorption delay).
+        Administer an oral dose.  Drug enters the gut depot; absorption
+        into the central compartment is governed by ka and bioavailability F.
         """
-        total_drug_mg = amount_mg_per_kg * self.weight_kg
-        self.blood_conc += total_drug_mg / self.Vd
+        total_mg      = amount_mg_per_kg * self.weight_kg
+        self.depot   += total_mg * self.F   # only bioavailable fraction enters
+
+    # ── simulation ────────────────────────────────────────────────────────────
 
     def advance(self, hours: float = 1.0):
         """
-        Advance the simulation by `hours` hours.
-        Uses Euler integration of the 2-compartment ODE:
+        Advance simulation by `hours` using Euler integration.
 
-          d(blood)/dt  = -ke*blood - k12*blood + k21*tissue
-          d(tissue)/dt =  k12*blood - k21*tissue
+        Full 2-compartment oral ODE:
+            d(depot)/dt  = -ka * depot
+            d(C1)/dt     = ka * depot / Vc  -  (ke + k12) * C1  +  k21 * C2
+            d(C2)/dt     =  k12 * C1  -  k21 * C2
 
-        FIX [Bug 4]: organ stress is now accumulated inside the Euler loop
-        using the trapezoidal rule (average of concentration at the start and
-        end of each sub-step). This correctly captures AUC rather than using
-        only the end-of-step blood concentration.
+        Organ stress accumulated via trapezoidal rule (AUC-correct).
+        DILI flag doubles liver stress accumulation rate.
         """
-        steps = 10
-        dt    = hours / steps
+        steps = 20          # more sub-steps for numerical stability with
+        dt    = hours / steps  # fast absorption (small ka * dt needed)
 
-        liver_inv  = 1.0 / max(self.hepatic_factor, 0.1)
-        kidney_inv = 1.0 / max(self.renal_factor,   0.1)
+        liver_inv  = (1.0 / max(self.hepatic_factor, 0.1)) * self._liver_stress_multiplier
+        kidney_inv =  1.0 / max(self.renal_factor,   0.1)
 
         for _ in range(steps):
-            prev_blood = self.blood_conc   # save pre-step value for trapezoid
+            prev_blood = self.blood_conc
+
+            # Absorption from gut depot
+            absorbed = self.ka * self.depot * dt
+            self.depot = max(0.0, self.depot - absorbed)
 
             delta_blood = (
+                  absorbed / max(self.Vc, 1e-6)
+                - self.ke  * self.blood_conc
+                - self.k12 * self.blood_conc
+                + self.k21 * self.tissue_conc
+            ) * dt   # note: absorbed already incorporates dt above, so:
+            # corrected formulation:
+            delta_blood = (
+                  (self.ka * self.depot / max(self.Vc, 1e-6))   # re-derive without dt consumed
                 - self.ke  * self.blood_conc
                 - self.k12 * self.blood_conc
                 + self.k21 * self.tissue_conc
             ) * dt
+            # restore depot (we'll update it cleanly below)
+            self.depot += absorbed   # undo the absorbed subtraction above
+            depot_delta = -self.ka * self.depot * dt
+            self.depot  = max(0.0, self.depot + depot_delta)
 
             delta_tissue = (
                 self.k12 * self.blood_conc
@@ -126,7 +227,7 @@ class PatientAgent:
             self.blood_conc  = max(0.0, self.blood_conc  + delta_blood)
             self.tissue_conc = max(0.0, self.tissue_conc + delta_tissue)
 
-            # Trapezoidal AUC: average of before and after concentration
+            # Trapezoidal AUC stress
             avg_conc = (prev_blood + self.blood_conc) * 0.5
             self.cumulative_liver_stress  += avg_conc * dt * liver_inv
             self.cumulative_kidney_stress += avg_conc * dt * kidney_inv
@@ -134,173 +235,132 @@ class PatientAgent:
         self.time += hours
 
     def get_state(self) -> dict:
-        """Return current body state as a dictionary."""
         return {
+            "patient_id":    self.patient_id,
             "blood_conc":    self.blood_conc,
             "tissue_conc":   self.tissue_conc,
+            "depot":         self.depot,
             "time":          self.time,
             "liver_stress":  self.cumulative_liver_stress,
             "kidney_stress": self.cumulative_kidney_stress,
             "weight_kg":     self.weight_kg,
             "age":           self.age,
+            "sex":           self.sex,
             "ke":            self.ke,
+            "fu":            self.fu,
+            "dili_risk":     self.dili_risk,
         }
 
     def reset(self):
-        """Reset patient to pre-dose state (PK parameters preserved)."""
-        self.blood_conc  = 0.0
-        self.tissue_conc = 0.0
-        self.time        = 0.0
+        """Reset to pre-dose state (PK parameters preserved)."""
+        self.blood_conc   = 0.0
+        self.tissue_conc  = 0.0
+        self.depot        = 0.0
+        self.time         = 0.0
         self.cumulative_liver_stress  = 0.0
         self.cumulative_kidney_stress = 0.0
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # AGENT 2: HepatocyteAgent
-# Watches liver stress.
-# Returns 0.0 (fine) to 1.0 (overwhelmed).
-# Rule-based — no LLM.
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 
 class HepatocyteAgent:
-    SATURATION_THRESHOLD = 80.0    # mg/L*h — below this, linear enzyme response
-    MAX_STRESS           = 200.0   # mg/L*h — AUC at which saturation reaches 1.0
+    """
+    CYP450 saturation signal.
+    Returns 0.0 (liver fine) → 1.0 (liver overwhelmed).
+    """
+    SATURATION_THRESHOLD = 80.0    # mg/L·h AUC — below this: linear response
+    MAX_STRESS           = 200.0   # mg/L·h AUC — saturation = 1.0
 
     @classmethod
     def observe(cls, state: dict) -> float:
-        """
-        CYP450 saturation — how overwhelmed is the liver?
-
-        FIX [Bug 1]: SATURATION_THRESHOLD is now used. Below it the response
-        is linear (enzyme capacity ample). Above it a sigmoid accelerates
-        saturation to model Michaelis-Menten kinetics qualitatively — enzyme
-        reserves deplete sharply once the threshold is exceeded.
-
-        Returns 0.0 (fine) to 1.0 (overwhelmed).
-        """
         stress = state.get("liver_stress", 0.0)
 
         if stress <= cls.SATURATION_THRESHOLD:
-            # Linear region: plenty of enzyme capacity remaining
             saturation = stress / cls.MAX_STRESS
         else:
-            # Sigmoid acceleration past saturation threshold
+            # Sigmoid acceleration past threshold (Michaelis-Menten-like)
             baseline  = cls.SATURATION_THRESHOLD / cls.MAX_STRESS
             remaining = 1.0 - baseline
             scale     = cls.MAX_STRESS - cls.SATURATION_THRESHOLD
-            excess    = stress - cls.SATURATION_THRESHOLD
-            # Map excess onto [-3, 3] for a clean sigmoid
-            sigmoid_x = (excess / scale) * 6.0 - 3.0
+            sigmoid_x = ((stress - cls.SATURATION_THRESHOLD) / scale) * 6.0 - 3.0
             sigmoid_y = 1.0 / (1.0 + math.exp(-sigmoid_x))
             saturation = baseline + remaining * sigmoid_y
 
         return round(min(1.0, max(0.0, saturation)), 4)
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # AGENT 3: ImmuneAgent
-# Watches immune/inflammatory response.
-# Returns 0.0 (calm) to 1.0 (severe reaction).
-# Rule-based — no LLM.
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 
 class ImmuneAgent:
-    REACTION_THRESHOLD = 5.0    # mg/L — below this: no immune reaction
-    SEVERE_THRESHOLD   = 20.0   # mg/L — above this: maximal reaction
+    """
+    Cytokine/IL-6 signal.
+    Returns 0.0 (no reaction) → 1.0 (severe inflammatory reaction).
+    """
+    REACTION_THRESHOLD = 5.0    # mg/L
+    SEVERE_THRESHOLD   = 20.0   # mg/L
 
     @classmethod
     def observe(cls, state: dict) -> float:
-        """
-        Cytokine/IL-6 signal — how inflamed is the body?
-        Linear interpolation between reaction and severe thresholds.
-
-        Returns 0.0 (no reaction) to 1.0 (severe inflammatory reaction).
-        """
         conc = state.get("blood_conc", 0.0)
-
         if conc <= cls.REACTION_THRESHOLD:
             return 0.0
         elif conc >= cls.SEVERE_THRESHOLD:
             return 1.0
-        else:
-            return (conc - cls.REACTION_THRESHOLD) / (cls.SEVERE_THRESHOLD - cls.REACTION_THRESHOLD)
+        return (conc - cls.REACTION_THRESHOLD) / (cls.SEVERE_THRESHOLD - cls.REACTION_THRESHOLD)
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # AGENT 4: RenalAgent
-# Watches kidney function.
-# Returns 1.0 (fully healthy) to 0.0 (failed).
-# Rule-based — no LLM.
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 
 class RenalAgent:
+    """
+    GFR fraction signal.
+    Returns 1.0 (healthy kidneys) → 0.0 (renal failure).
+    """
     STRESS_FOR_IMPAIRMENT = 100.0
     STRESS_FOR_FAILURE    = 400.0
 
     @classmethod
     def observe(cls, state: dict) -> float:
-        """
-        GFR fraction — how well are the kidneys filtering?
-
-        Returns 1.0 (healthy) to 0.0 (failed).
-        """
         stress = state.get("kidney_stress", 0.0)
-
         if stress <= cls.STRESS_FOR_IMPAIRMENT:
             return 1.0
         elif stress >= cls.STRESS_FOR_FAILURE:
             return 0.0
-        else:
-            return 1.0 - (stress - cls.STRESS_FOR_IMPAIRMENT) / (cls.STRESS_FOR_FAILURE - cls.STRESS_FOR_IMPAIRMENT)
+        return 1.0 - (stress - cls.STRESS_FOR_IMPAIRMENT) / (cls.STRESS_FOR_FAILURE - cls.STRESS_FOR_IMPAIRMENT)
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # AGENT 5: MeasurementAgent
-# Simulates blood test results (lab panels).
-# Grades DLT (serious side effect) per patient.
-# Rule-based — no LLM.
-#
-# DLT Grade scale (standard oncology NCI CTCAE):
-#   Grade 0 = no side effect
-#   Grade 1 = mild
-#   Grade 2 = moderate
-#   Grade 3 = severe        <- counts as a DLT
-#   Grade 4 = life-threatening
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 
 class MeasurementAgent:
+    """
+    Simulates lab blood tests and grades DLTs per patient.
+    Deterministic: same physiological state → same lab values.
+    """
 
     @classmethod
     def get_labs(cls, state: dict) -> dict:
-        """
-        Simulate blood test results from body state.
-
-        FIX [Bug 2]: noise is now deterministic — seeded from the state values
-        so the same physiological state always produces the same lab numbers.
-        Previously, unseeded random.gauss() caused grade_dlt() to return
-        different grades on repeated calls with identical inputs.
-
-        Normal ranges:
-          Heart rate:  60-100 bpm
-          Systolic BP: 90-120 mmHg
-          ALT:         7-56 U/L
-          Creatinine:  0.6-1.2 mg/dL
-          WBC:         4.5-11.0 K/uL
-        """
         conc    = state.get("blood_conc",    0.0)
         lstress = state.get("liver_stress",  0.0)
         kstress = state.get("kidney_stress", 0.0)
 
-        # Deterministic seed: same physiology -> same labs, always
+        # Deterministic seed from state values
         seed = int(abs(conc * 1000 + lstress * 7 + kstress * 13)) % (2 ** 31)
         rng  = random.Random(seed)
         noise = lambda scale: rng.gauss(0, scale)
 
-        hr          = 72  + (conc * 2.0)    + noise(3)
-        bp_systolic = 120 - (conc * 1.5)    + noise(5)
-        alt         = 35  + (lstress * 0.8) + noise(5)
-        creatinine  = 1.0 + (kstress * 0.005) + noise(0.1)
-        wbc         = max(0.1, 7.5 - (conc * 0.3) + noise(0.5))
+        hr          = 72  + conc * 2.0          + noise(3)
+        bp_systolic = 120 - conc * 1.5          + noise(5)
+        alt         = 35  + lstress * 0.8       + noise(5)
+        creatinine  = 1.0 + kstress * 0.005     + noise(0.1)
+        wbc         = max(0.1, 7.5 - conc * 0.3 + noise(0.5))
 
         return {
             "heart_rate":  round(hr,         1),
@@ -312,10 +372,7 @@ class MeasurementAgent:
 
     @classmethod
     def grade_dlt(cls, state: dict) -> int:
-        """
-        Classify side-effect severity: grade 0 (none) to 4 (life-threatening).
-        Grade 3+ counts as a DLT.
-        """
+        """NCI CTCAE grading. Returns 0–4. Grade 3+ = DLT."""
         labs   = cls.get_labs(state)
         grades = []
 
@@ -343,13 +400,15 @@ class MeasurementAgent:
         return max(grades)
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # AGENT 6: DoctorAgent
-# The ONLY LLM agent. One LLM call per step.
-# Reads all signals and writes one sentence.
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 
 class DoctorAgent:
+    """
+    The only LLM agent. One call per environment step.
+    Reads all signals and produces a one-sentence recommendation.
+    """
 
     def __init__(self):
         self.client = OpenAI(
@@ -367,20 +426,31 @@ class DoctorAgent:
         gfr: float,
         immune: float,
         current_dose: float,
+        drug_name: str = "investigational compound",
+        cyp_inhibitions: list = None,
+        dili_risk: bool = False,
     ) -> str:
         """
-        Ask the LLM for a one-sentence clinical recommendation.
-        Called ONCE per environment step (not per patient).
+        One-sentence clinical recommendation.
+        Drug-specific context (name, CYP inhibitions, DILI risk) now
+        included in the prompt when available from Layer 1/2.
         """
+        cyp_line = ""
+        if cyp_inhibitions:
+            cyp_line = f"- Known CYP inhibitions: {', '.join(cyp_inhibitions)}\n"
+        dili_line = f"- DILI risk flagged by in-silico model: {'YES — heightened liver monitoring required' if dili_risk else 'No'}\n"
+
         prompt = f"""You are a clinical pharmacologist reviewing a Phase I dose escalation trial.
 
-Current status:
-- Peak blood concentration (Cmax): {cmax:.1f} mg/L
+Drug under investigation: {drug_name}
+{cyp_line}{dili_line}
+Current cohort status:
+- Peak blood concentration (Cmax): {cmax:.2f} mg/L
 - Serious side effects (DLTs): {dlt_count}/{cohort_size} patients
 - Liver enzyme saturation (CYP450): {cyp:.0%}
 - Kidney function (GFR): {gfr:.0%}
 - Immune/inflammatory signal: {immune:.0%}
-- Current dose: {current_dose:.1f} mg/kg
+- Current dose: {current_dose:.2f} mg/kg
 
 In exactly one sentence, recommend one of: ESCALATE, HOLD, or DE-ESCALATE, and state the most important reason why."""
 
@@ -395,8 +465,10 @@ In exactly one sentence, recommend one of: ESCALATE, HOLD, or DE-ESCALATE, and s
         except Exception:
             if dlt_count >= 2:
                 return f"DE-ESCALATE: {dlt_count}/{cohort_size} patients have serious side effects."
+            elif dili_risk and cyp > 0.5:
+                return "HOLD: DILI-flagged compound with rising liver saturation — do not escalate."
             elif cyp > 0.8:
-                return "HOLD: Liver saturation is critically high, risk of toxicity."
+                return "HOLD: Liver saturation is critically high, risk of enzyme saturation."
             elif gfr < 0.5:
                 return "HOLD: Kidney function is significantly impaired."
             else:

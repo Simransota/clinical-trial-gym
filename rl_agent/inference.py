@@ -46,13 +46,15 @@ import os
 import json
 import textwrap
 from typing import List, Optional
-
 from openai import OpenAI
 
 # from my_env_v4 import MyEnvV4Action, MyEnvV4Env  # Not needed, using HTTP
 import requests
 
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+
+# Set OPENAI_API_KEY for the OpenAI client
+os.environ["OPENAI_API_KEY"] = API_KEY
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
@@ -182,9 +184,6 @@ def parse_action(response_text: str, current_dose: float) -> dict:
 def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    # env = await MyEnvV4Env.from_docker_image(IMAGE_NAME)  # Not using Docker, using HTTP
-
-    history: List[str] = []
     rewards: List[float] = []
     steps_taken = 0
     score = 0.0
@@ -193,10 +192,9 @@ def main() -> None:
     log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        result = env_reset()  # Not async
+        result = env_reset()
         obs = result
         current_dose = obs.get("dose_level", 1.0)
-        last_reward = 0.0
 
         for step in range(1, MAX_STEPS + 1):
             if result.get("done", False):
@@ -204,32 +202,24 @@ def main() -> None:
 
             message = get_model_message(client, obs, step)
             action = parse_action(message, current_dose)
-
             result = env_step(action)
             obs = result
             current_dose = obs.get("dose_level", current_dose)
-
             reward = float(result.get("reward", 0.0))
             done = bool(result.get("done", False))
-            error = None
-
             rewards.append(reward)
             steps_taken = step
-            last_reward = reward
-
-            action_str = json.dumps(action)
-            log_step(step=step, action=action_str, reward=reward, done=done, error=error)
-
+            log_step(step=step, action=json.dumps(action),
+                     reward=reward, done=done, error=None)
             if done:
                 break
 
-        score = sum(rewards) / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.0
-        score = min(max(score, 0.0), 1.0)  # clamp to [0, 1]
+        score = min(max(sum(rewards) / MAX_TOTAL_REWARD, 0.0), 1.0)
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     finally:
-        # No env.close() needed for HTTP
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+        log_end(success=success, steps=steps_taken,
+                score=score, rewards=rewards)
 
 
 if __name__ == "__main__":
