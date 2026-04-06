@@ -281,84 +281,84 @@ class RlAgentEnvironment(Environment):
             p.dose(dose)
             p.advance(hours=hours)
 
-def _compute_reward(self, dlt_count, cohort_size, fda_stop, avg_hep, avg_ren) -> float:
-    """
-    Improved reward function — shaped by observable signals only.
-    No hidden RP2D comparison. Rewards the agent for:
-      1. Keeping patients safe (no DLTs)
-      2. Making progress (increasing dose when safe)
-      3. Stopping at the right time (when DLTs appear)
-      4. Maintaining organ health throughout
-    """
-    dlt_rate = dlt_count / max(cohort_size, 1)
+    def _compute_reward(self, dlt_count, cohort_size, fda_stop, avg_hep, avg_ren) -> float:
+        """
+        Improved reward function — shaped by observable signals only.
+        No hidden RP2D comparison. Rewards the agent for:
+          1. Keeping patients safe (no DLTs)
+          2. Making progress (increasing dose when safe)
+          3. Stopping at the right time (when DLTs appear)
+          4. Maintaining organ health throughout
+        """
+        dlt_rate = dlt_count / max(cohort_size, 1)
 
-    # ── Component 1: Safety (40%) ─────────────────────────────────────────
-    # Hard zero if FDA stops the trial
-    # Smooth penalty proportional to DLT rate otherwise
-    if fda_stop:
-        safety = 0.0
-    elif dlt_rate == 0:
-        safety = 1.0
-    elif dlt_rate <= 0.167:      # 1 DLT in 6 patients — acceptable
-        safety = 0.8
-    elif dlt_rate <= 0.33:       # 2 DLTs in 6 — borderline
-        safety = 0.4
-    else:
-        safety = 0.0             # above FDA limit
-
-    # ── Component 2: Escalation progress (35%) ────────────────────────────
-    # Reward for making progress: escalating when safe, holding when not
-    # Uses only observable signals — no hidden RP2D comparison
-    if dlt_rate == 0 and avg_hep < 0.5 and avg_ren > 0.7:
-        # All clear — reward for being at a higher dose than last step
-        prev_dose = self.history[-2]["dose"] if len(self.history) >= 2 else 0
-        if self.current_dose > prev_dose:
-            progress = min(1.0, self.current_dose / 20.0)   # scales with dose
+        # ── Component 1: Safety (40%) ─────────────────────────────────────────
+        # Hard zero if FDA stops the trial
+        # Smooth penalty proportional to DLT rate otherwise
+        if fda_stop:
+            safety = 0.0
+        elif dlt_rate == 0:
+            safety = 1.0
+        elif dlt_rate <= 0.167:      # 1 DLT in 6 patients — acceptable
+            safety = 0.8
+        elif dlt_rate <= 0.33:       # 2 DLTs in 6 — borderline
+            safety = 0.4
         else:
-            progress = 0.3    # holding dose is acceptable but not optimal
-    elif dlt_rate > 0 and self.current_dose <= (self.history[-2]["dose"] if len(self.history) >= 2 else self.current_dose):
-        # DLTs appeared AND agent de-escalated — reward correct behavior
-        progress = 0.7
-    elif dlt_rate > 0:
-        # DLTs appeared but agent kept escalating — penalize
-        progress = 0.1
-    else:
-        progress = 0.5
+            safety = 0.0             # above FDA limit
 
-    # ── Component 3: Stopping behavior (15%) ─────────────────────────────
-    # Reward the agent for stopping at the right time
-    # Good stopping = DLTs just appeared, dose is meaningful (>3 mg/kg)
-    if fda_stop:
-        stopping = 0.0    # stopped because forced — not ideal
-    elif not (len(self.history) > 0 and self.history[-1].get("escalate", True)):
-        # Agent voluntarily stopped
-        if dlt_rate > 0 and self.current_dose > 3.0:
-            stopping = 1.0    # stopped when DLTs appeared at meaningful dose
-        elif dlt_rate == 0 and self.current_dose > 8.0:
-            stopping = 0.7    # stopped conservatively at a reasonable dose
+        # ── Component 2: Escalation progress (35%) ────────────────────────────
+        # Reward for making progress: escalating when safe, holding when not
+        # Uses only observable signals — no hidden RP2D comparison
+        if dlt_rate == 0 and avg_hep < 0.5 and avg_ren > 0.7:
+            # All clear — reward for being at a higher dose than last step
+            prev_dose = self.history[-2]["dose"] if len(self.history) >= 2 else 0
+            if self.current_dose > prev_dose:
+                progress = min(1.0, self.current_dose / 20.0)   # scales with dose
+            else:
+                progress = 0.3    # holding dose is acceptable but not optimal
+        elif dlt_rate > 0 and self.current_dose <= (self.history[-2]["dose"] if len(self.history) >= 2 else self.current_dose):
+            # DLTs appeared AND agent de-escalated — reward correct behavior
+            progress = 0.7
+        elif dlt_rate > 0:
+            # DLTs appeared but agent kept escalating — penalize
+            progress = 0.1
         else:
-            stopping = 0.3    # stopped too early
-    else:
-        stopping = 0.5        # still escalating — neutral
+            progress = 0.5
 
-    # ── Component 4: Organ health (10%) ──────────────────────────────────
-    organ = avg_ren * 0.5 + (1.0 - avg_hep) * 0.5
+        # ── Component 3: Stopping behavior (15%) ─────────────────────────────
+        # Reward the agent for stopping at the right time
+        # Good stopping = DLTs just appeared, dose is meaningful (>3 mg/kg)
+        if fda_stop:
+            stopping = 0.0    # stopped because forced — not ideal
+        elif not (len(self.history) > 0 and self.history[-1].get("escalate", True)):
+            # Agent voluntarily stopped
+            if dlt_rate > 0 and self.current_dose > 3.0:
+                stopping = 1.0    # stopped when DLTs appeared at meaningful dose
+            elif dlt_rate == 0 and self.current_dose > 8.0:
+                stopping = 0.7    # stopped conservatively at a reasonable dose
+            else:
+                stopping = 0.3    # stopped too early
+        else:
+            stopping = 0.5        # still escalating — neutral
 
-    # ── Combine ───────────────────────────────────────────────────────────
-    value = (
-        0.40 * safety   +
-        0.35 * progress +
-        0.15 * stopping +
-        0.10 * organ
-    )
+        # ── Component 4: Organ health (10%) ──────────────────────────────────
+        organ = avg_ren * 0.5 + (1.0 - avg_hep) * 0.5
 
-    # ── Episode bonus ─────────────────────────────────────────────────────
-    # Extra reward if this step found the RP2D zone
-    # RP2D zone = first step where DLTs appeared after safe escalation
-    if dlt_rate > 0 and len(self.history) >= 2:
-        prev_dlt = self.history[-2].get("dlt_count", 0) if self.history else 0
-        if prev_dlt == 0:
-            # This is the exact transition point — DLTs just appeared
-            value = min(1.0, value + 0.15)
+        # ── Combine ───────────────────────────────────────────────────────────
+        value = (
+            0.40 * safety   +
+            0.35 * progress +
+            0.15 * stopping +
+            0.10 * organ
+        )
 
-    return round(min(1.0, max(0.0, value)), 3)
+        # ── Episode bonus ─────────────────────────────────────────────────────
+        # Extra reward if this step found the RP2D zone
+        # RP2D zone = first step where DLTs appeared after safe escalation
+        if dlt_rate > 0 and len(self.history) >= 2:
+            prev_dlt = self.history[-2].get("dlt_count", 0) if self.history else 0
+            if prev_dlt == 0:
+                # This is the exact transition point — DLTs just appeared
+                value = min(1.0, value + 0.15)
+
+        return round(min(1.0, max(0.0, value)), 3)
