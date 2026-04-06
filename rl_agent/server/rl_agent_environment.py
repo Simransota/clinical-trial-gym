@@ -76,7 +76,7 @@ class RlAgentEnvironment(Environment):
         self.history = []
         self.rp2d_dose = None
         self._done = False
-        self._use_llm = os.getenv("USE_LLM", "false").lower() == "true"
+        self._use_llm = True
         self.doctor = DoctorAgent() if self._use_llm else None
 
     # ── reset() ─────────────────────────────────────────────────────────────

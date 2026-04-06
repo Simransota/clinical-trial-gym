@@ -1,5 +1,5 @@
-# clinical-trial-gym
-# Clinical Trial RL Environment
+
+# Clinical Trial Gym
 
 An AI training environment that simulates Phase I clinical drug trials. An AI agent learns to find the right dose for a new drug — high enough to be effective, low enough to be safe — by running simulated trials on virtual patients.
 
@@ -12,7 +12,6 @@ rl_agent/
 ├── models.py                    # Data contracts (Action / Observation)
 ├── client.py                    # Python SDK for the environment
 ├── inference.py                 # LLM agent — what judges run to score
-├── analysis.py                  # Layer 5: visualization & analysis
 ├── openenv.yaml                 # OpenEnv config (3 tasks)
 ├── validate.sh                  # Pre-submission checker
 ├── .env                         # Secrets (never pushed to GitHub)
@@ -113,19 +112,6 @@ Lets other Python code connect to the environment cleanly via WebSocket or HTTP.
 
 ---
 
-### `analysis.py` — Layer 5 visualization
-
-Runs a complete trial and generates:
-
-- PK concentration-time curves using `scipy.integrate.solve_ivp` (real ODE solver)
-- 4-panel matplotlib dashboard: dose escalation, organ signals, reward curve, Cmax vs dose
-- Interactive Plotly HTML dashboard with hover tooltips
-- CSV export of all trial data
-
-Adapts dynamically to any drug (pass SMILES string), any dose schedule, and any patient weights.
-
----
-
 ### `openenv.yaml` — hackathon config
 
 Declares the three tasks and difficulty levels. First thing the hackathon validator reads.
@@ -162,9 +148,6 @@ export HF_TOKEN=hf_your_token_here
 export API_BASE_URL=https://router.huggingface.co/v1
 export MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
 python inference.py
-
-# Run analysis and visualization
-python analysis.py --task phase_i_dosing
 ```
 
 ---
@@ -177,7 +160,7 @@ python analysis.py --task phase_i_dosing
 | `API_BASE_URL` | LLM API endpoint (default: HuggingFace router) |
 | `MODEL_NAME` | Model identifier (default: Qwen2.5-7B-Instruct) |
 | `ENV_URL` | Environment server URL (default: http://localhost:8000) |
-| `USE_LLM` | Enable LLM doctor agent — `true` or `false` |
+
 
 ---
 
