@@ -1,0 +1,16 @@
+spec_version: 1
+name: rxgym
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+tasks:
+  - id: phase_i_dosing
+    difficulty: easy
+    description: "Single drug Phase I dose escalation — find RP2D safely"
+  - id: allometric_scaling
+    difficulty: medium
+    description: "Translate rodent dose to human equivalent"
+  - id: combo_ddi
+    difficulty: hard
+    description: "Multi-drug combo scheduling minimizing drug-drug interactions"

@@ -1,0 +1,33 @@
+# openenv.yaml
+# Goes in ROOT folder: /Users/simransota/meta/rl_agent/openenv.yaml
+# REPLACE the existing file completely.
+
+spec_version: 1
+name: rxgym
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+
+tasks:
+  - id: phase_i_dosing
+    difficulty: easy
+    description: >
+      Single drug Phase I dose escalation.
+      Agent finds the RP2D (recommended phase II dose)
+      by escalating dose across cohorts while respecting
+      FDA stopping rules (max 33% DLT rate).
+
+  - id: allometric_scaling
+    difficulty: medium
+    description: >
+      Translate a rodent RP2D to a safe human starting dose
+      using allometric scaling (body weight exponent 0.75).
+      Agent proposes a human dose from preclinical animal data.
+
+  - id: combo_ddi
+    difficulty: hard
+    description: >
+      Schedule two drugs simultaneously to minimize
+      drug-drug interactions (CYP450 enzyme competition)
+      while maintaining therapeutic efficacy for both.
