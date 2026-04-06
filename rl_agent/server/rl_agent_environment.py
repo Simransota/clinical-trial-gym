@@ -108,12 +108,12 @@ class RlAgentEnvironment(Environment):
 
     def __init__(self, drug_profile: dict = None):
         self._state    = State(episode_id=str(uuid4()), step_count=0)
-        self.cohort    = []
-        self.history   = []
-        self.pk_traces = []
-        self.cohort_log = []
-        self.rp2d_dose = None
-        self._done     = False
+        self.cohort       = []
+        self.history      = []
+        self.pk_traces    = []   # list[list[dict]] — per-step, per-patient time-series
+        self.cohort_log   = []   # list[list[dict]] — per-step patient demographics + outcomes
+        self.rp2d_dose    = None
+        self._done        = False
         self._use_llm  = True
         self.doctor    = DoctorAgent() if self._use_llm else None
 
@@ -203,6 +203,38 @@ class RlAgentEnvironment(Environment):
         avg_ren   = float(np.mean(ren_signals))
         avg_cmax  = float(np.mean(cmax_vals))
 
+        # 4b. Capture PK traces for Layer 5 analysis
+        # Re-simulate each patient to get the full time-series (24 timepoints)
+        step_traces = []
+        for p in self.cohort:
+            trace = self._get_pk_trace(p, self.current_dose)
+            step_traces.append(trace)
+        self.pk_traces.append(step_traces)
+
+        # 4c. Capture patient demographics + outcomes for Layer 5
+        step_cohort = []
+        for i, p in enumerate(self.cohort):
+            s = states[i]
+            step_cohort.append({
+                "patient_id":    s.get("patient_id", f"PT-{i}"),
+                "age":           s["age"],
+                "sex":           s["sex"],
+                "weight_kg":     s["weight_kg"],
+                "ke":            s["ke"],
+                "fu":            s["fu"],
+                "renal_factor":  p.renal_factor,
+                "hepatic_factor":p.hepatic_factor,
+                "blood_conc":    s["blood_conc"],
+                "liver_stress":  s["liver_stress"],
+                "kidney_stress": s["kidney_stress"],
+                "hep_signal":    hep_signals[i],
+                "imm_signal":    imm_signals[i],
+                "ren_signal":    ren_signals[i],
+                "dlt_grade":     dlt_grades[i],
+                "is_dlt":        dlt_grades[i] >= 3,
+            })
+        self.cohort_log.append(step_cohort)
+
         # 5. FDA stopping rules
         dlt_rate      = dlt_count / len(self.cohort)
         fda_stop      = dlt_rate > FDA_RULES["max_dlt_rate"]
@@ -225,11 +257,7 @@ class RlAgentEnvironment(Environment):
             "reward":      0.0,               # back-filled below
         })
 
-        # 7. Build episode trace / cohort log for visualization
-        self.pk_traces.append(self._build_step_pk_traces(self.cohort, self.current_dose))
-        self.cohort_log.append(self._build_step_cohort_log(self.cohort, dlt_grades, hep_signals, imm_signals, ren_signals))
-
-        # 8. Compute reward
+        # 7. Compute reward
         reward = self._compute_reward(
             dlt_count=dlt_count,
             cohort_size=len(self.cohort),
@@ -341,90 +369,7 @@ class RlAgentEnvironment(Environment):
         ddi_score    = max(0.0, 1.0 - total_dlts * 0.1)
         return round(min(1.0, 0.4 * efficacy + 0.4 * safety_score + 0.2 * ddi_score), 3)
 
-    def get_episode_data(self) -> dict:
-        """Return the episode data required by the visualization pipeline."""
-        return {
-            "drug_name":     self.drug_name,
-            "drug_params":   self.drug_params,
-            "safety_flags":  self.safety_flags,
-            "start_dose":    self._start_dose,
-            "history":       self.history,
-            "pk_traces":     self.pk_traces,
-            "cohort_log":    self.cohort_log,
-            "final_score": {
-                "phase_i_dosing":    self.grade_episode("phase_i_dosing"),
-                "allometric_scaling": self.grade_episode("allometric_scaling"),
-                "combo_ddi":          self.grade_episode("combo_ddi"),
-            },
-            "rp2d_dose":     self.rp2d_dose,
-            "steps_taken":   len(self.history),
-        }
-
     # ── private helpers ──────────────────────────────────────────────────────
-
-    def _build_step_pk_traces(self, cohort, dose: float, hours: float = 24.0, dt: float = 0.5):
-        traces = []
-        for p in cohort:
-            trace_agent = PatientAgent(
-                weight_kg      = p.weight_kg,
-                age            = p.age,
-                sex            = p.sex,
-                renal_factor   = p.renal_factor,
-                hepatic_factor = p.hepatic_factor,
-                drug_params    = self.drug_params or None,
-                safety_flags   = self.safety_flags or None,
-            )
-            trace_agent.patient_id = p.patient_id
-            trace_agent.dose(dose)
-
-            times, blood, tissue = [0.0], [trace_agent.blood_conc], [trace_agent.tissue_conc]
-            steps = int(hours / dt)
-            for _ in range(steps):
-                trace_agent.advance(dt)
-                times.append(round(trace_agent.time, 3))
-                blood.append(round(trace_agent.blood_conc, 4))
-                tissue.append(round(trace_agent.tissue_conc, 4))
-
-            cmax = round(max(blood), 4)
-            tmax = round(times[blood.index(cmax)], 3)
-            auc  = round(sum(blood) * dt, 4)
-            traces.append({
-                "patient_id": p.patient_id,
-                "age": p.age,
-                "sex": p.sex,
-                "weight_kg": p.weight_kg,
-                "time_h": times,
-                "blood_conc": blood,
-                "tissue_conc": tissue,
-                "cmax": cmax,
-                "tmax": tmax,
-                "auc": auc,
-            })
-        return traces
-
-    def _build_step_cohort_log(self, cohort, dlt_grades, hep_signals, imm_signals, ren_signals):
-        step_log = []
-        for p, grade, hep, imm, ren in zip(cohort, dlt_grades, hep_signals, imm_signals, ren_signals):
-            state = p.get_state()
-            step_log.append({
-                "patient_id": p.patient_id,
-                "age": p.age,
-                "sex": p.sex,
-                "weight_kg": p.weight_kg,
-                "ke": p.ke,
-                "fu": p.fu,
-                "renal_factor": p.renal_factor,
-                "hepatic_factor": p.hepatic_factor,
-                "blood_conc": state["blood_conc"],
-                "liver_stress": state["liver_stress"],
-                "kidney_stress": state["kidney_stress"],
-                "hep_signal": round(hep, 3),
-                "imm_signal": round(imm, 3),
-                "ren_signal": round(ren, 3),
-                "dlt_grade": grade,
-                "is_dlt": grade >= 3,
-            })
-        return step_log
 
     def _make_cohort(self, size: int):
         """
@@ -453,6 +398,85 @@ class RlAgentEnvironment(Environment):
             p.reset()
             p.dose(dose)
             p.advance(hours=hours)
+
+    def _get_pk_trace(self, patient, dose: float, hours: float = 24.0, n_points: int = 48) -> dict:
+        """
+        Re-simulate a single patient at fine time resolution to get the full
+        concentration-time curve for plotting. Returns a dict with time,
+        blood_conc, tissue_conc arrays — ready for Layer 5 PK curve plots.
+        """
+        from agents import PatientAgent as PA
+        # Clone a fresh patient with same parameters
+        p = PA(
+            weight_kg      = patient.weight_kg,
+            age            = patient.age,
+            sex            = patient.sex,
+            renal_factor   = patient.renal_factor,
+            hepatic_factor = patient.hepatic_factor,
+            drug_params    = self.drug_params or None,
+            safety_flags   = self.safety_flags or None,
+        )
+        p.dose(dose)
+        dt = hours / n_points
+        times, blood, tissue = [], [], []
+        for i in range(n_points):
+            times.append(round(i * dt, 3))
+            blood.append(round(p.blood_conc, 4))
+            tissue.append(round(p.tissue_conc, 4))
+            p.advance(hours=dt)
+        # Add final timepoint
+        times.append(hours)
+        blood.append(round(p.blood_conc, 4))
+        tissue.append(round(p.tissue_conc, 4))
+        return {
+            "patient_id":    getattr(patient, "patient_id", "unknown"),
+            "age":           patient.age,
+            "sex":           patient.sex,
+            "weight_kg":     round(patient.weight_kg, 1),
+            "time_h":        times,
+            "blood_conc":    blood,
+            "tissue_conc":   tissue,
+            "cmax":          round(max(blood), 4),
+            "tmax":          round(times[blood.index(max(blood))], 2),
+            "auc":           round(sum((blood[i] + blood[i+1]) / 2 * (times[i+1] - times[i])
+                                       for i in range(len(times)-1)), 4),
+        }
+
+    def get_episode_data(self) -> dict:
+        """
+        Return all data collected during the episode for Layer 5 analysis.
+        Call this after the episode ends.
+
+        Returns
+        -------
+        dict with keys:
+            drug_name       : str
+            drug_params     : dict  (Layer 1/2 PK params)
+            safety_flags    : dict  (Layer 1/2 safety flags)
+            start_dose      : float
+            history         : list[dict]  (one entry per step)
+            pk_traces       : list[list[dict]]  (step → patient → time-series)
+            cohort_log      : list[list[dict]]  (step → patient → demographics)
+            final_score     : dict  (all three task scores)
+            rp2d_dose       : float | None
+            steps_taken     : int
+        """
+        return {
+            "drug_name":    self.drug_name,
+            "drug_params":  self.drug_params,
+            "safety_flags": self.safety_flags,
+            "start_dose":   self._start_dose,
+            "history":      self.history,
+            "pk_traces":    self.pk_traces,
+            "cohort_log":   self.cohort_log,
+            "final_score": {
+                "phase_i_dosing":     self._grade_phase_i(),
+                "allometric_scaling": self._grade_allometric(),
+                "combo_ddi":          self._grade_combo_ddi(),
+            },
+            "rp2d_dose":   self.rp2d_dose,
+            "steps_taken": self._state.step_count,
+        }
 
     def _rule_based_rec(self, dlt_count, cohort_size, fda_stop, avg_hep, avg_ren) -> str:
         dili = self.safety_flags.get("dili_risk", False)
