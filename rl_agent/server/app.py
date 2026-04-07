@@ -30,7 +30,7 @@ Usage:
 
 from dotenv import load_dotenv
 load_dotenv()
-from fastapi import Request
+from fastapi import HTTPException
 from pydantic import BaseModel
 from typing import Optional
 try:
@@ -48,9 +48,18 @@ except ModuleNotFoundError:
     from server.rl_agent_environment import RlAgentEnvironment
 
 
+# Shared drug profile used by the environment factory.
+# OpenEnv creates a fresh environment instance per HTTP request.
+_CURRENT_DRUG_PROFILE = None
+
+
+def _env_factory():
+    return RlAgentEnvironment(drug_profile=_CURRENT_DRUG_PROFILE)
+
+
 # Create the app with web interface and README integration
 app = create_app(
-    RlAgentEnvironment,
+    _env_factory,
     RlAgentAction,
     RlAgentObservation,
     env_name="rl_agent",
@@ -96,31 +105,45 @@ def configure_drug(req: DrugRequest):
         sys.path.insert(0, os.path.join(_repo, "rl_agent"))
         from drug_profile_builder import DrugProfileBuilder
 
-    builder = DrugProfileBuilder(
-        smiles=req.smiles,
-        name=req.name,
-        source_species=req.source_species,
-        animal_dose_mgkg=req.animal_dose_mgkg,
-    )
-    profile = builder.build()
-    env_instance = app.state.env
-    env_instance.configure_drug(profile)
+    try:
+        builder = DrugProfileBuilder(
+            smiles=req.smiles,
+            name=req.name,
+            source_species=req.source_species,
+            animal_dose_mgkg=req.animal_dose_mgkg,
+        )
+        profile = builder.build()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "configuration_failed",
+                "reason": str(exc),
+                "drug": req.name,
+                "smiles": req.smiles,
+            },
+        ) from exc
+    global _CURRENT_DRUG_PROFILE
+    _CURRENT_DRUG_PROFILE = profile
+    start_dose = round(max(0.1, profile["human_equivalent_dose"] / 10.0), 3)
 
     return {
         "status":       "configured",
         "drug":         profile["name"],
         "smiles":       profile["smiles"],
         "hed_mgkg":     profile["human_equivalent_dose"],
-        "start_dose":   env_instance._start_dose,
+        "start_dose":   start_dose,
+        "drug_params":  profile["drug_params"],
         "admet_summary": profile["admet_summary"],
     }
 
 
 @app.get("/episode_data")
 def get_episode_data():
-    """Return full episode data for Layer 5 visualization."""
-    env_instance = app.state.env   # openenv stores the env here
-    return env_instance.get_episode_data()
+    """Episode data is only available in persistent WebSocket sessions."""
+    return {
+        "error": "episode_data is unavailable in stateless HTTP mode. Use /ws for persistent sessions."
+    }
 
 def main(host: str = "0.0.0.0", port: int = 8000):
     """

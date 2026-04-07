@@ -46,19 +46,6 @@ from openai import OpenAI
 # AGENT 1: PatientAgent
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Default PK parameters used when no drug_params dict is supplied.
-# These approximate a generic small-molecule oral drug.
-_DEFAULT_DRUG_PARAMS = {
-    "ka":  1.20,    # 1/h   — faster absorption than aspirin (heuristic)
-    "F":   0.80,    # fraction
-    "CL":  0.15,    # L/h/kg — human clearance (used to derive ke)
-    "Vc":  0.70,    # L/kg  — central Vd (per kg, multiplied by weight below)
-    "Vp":  0.467,   # L/kg  — peripheral Vd  (≈ Vc * 0.667, original k12/k21 ratio)
-    "Q":   0.06,    # L/h/kg — inter-compartmental CL (≈ k12 * Vc)
-    "PPB": 0.50,
-    "fu":  0.50,
-}
-
 _DEFAULT_SAFETY_FLAGS = {
     "dili_risk":       False,
     "herg_risk":       False,
@@ -111,9 +98,19 @@ class PatientAgent:
         self.renal_factor   = renal_factor
         self.hepatic_factor = hepatic_factor
 
+        if not drug_params:
+            raise ValueError(
+                "drug_params are required. Configure a molecule first so Layer 1/2 "
+                "can provide ka/F/CL/Vc/Vp/Q/PPB/fu."
+            )
+        required_keys = {"ka", "F", "CL", "Vc", "Vp", "Q", "PPB", "fu"}
+        missing = sorted(required_keys.difference(drug_params.keys()))
+        if missing:
+            raise ValueError(f"drug_params missing required keys: {missing}")
+
         # ── Resolve drug PK parameters ────────────────────────────────────────
         # Layer 1/2 provides per-kg values; multiply by weight where needed.
-        dp = {**_DEFAULT_DRUG_PARAMS, **(drug_params or {})}
+        dp = dict(drug_params)
 
         self.ka  = float(dp["ka"])
         self.F   = float(dp["F"])

@@ -118,32 +118,24 @@ class RlAgentEnvironment(Environment):
         self.doctor    = DoctorAgent() if self._use_llm else None
 
         # ── Unpack drug profile from Layer 1/2 ───────────────────────────────
+        self.drug_name = "unconfigured"
+        self.drug_params = {}
+        self.safety_flags = {}
+        self._start_dose = 0.0
+        self._drug_configured = False
+        self._drug_profile_hed = None
         if drug_profile:
-            self.drug_name    = drug_profile.get("name", "investigational compound")
-            self.drug_params  = drug_profile.get("drug_params",  {})
-            self.safety_flags = drug_profile.get("safety_flags", {})
-
-            # Starting dose: use Layer 2 allometric human equivalent dose.
-            # This replaces the arbitrary 1.0 mg/kg default with a
-            # scientifically grounded starting point.
-            hed = drug_profile.get("human_equivalent_dose", None)
-            if hed and hed > 0:
-                # FDA Oncology guidance: start at 1/10 of the HED
-                # (conservative; agent can escalate from here)
-                self._start_dose = round(max(0.1, hed / 10.0), 3)
-            else:
-                self._start_dose = 1.0
-        else:
-            self.drug_name    = "investigational compound"
-            self.drug_params  = {}
-            self.safety_flags = {}
-            self._start_dose  = 1.0
+            self.configure_drug(drug_profile)
 
         self.current_dose = self._start_dose
 
     # ── reset() ─────────────────────────────────────────────────────────────
     def reset(self) -> RlAgentObservation:
         """Start a fresh trial episode."""
+        if not self._drug_configured:
+            raise RuntimeError(
+                "No drug configured. Submit a molecule via /drug before calling /reset."
+            )
         self._state       = State(episode_id=str(uuid4()), step_count=0)
         self.current_dose = self._start_dose
         self.history      = []
@@ -176,6 +168,10 @@ class RlAgentEnvironment(Environment):
 
     # ── step() ──────────────────────────────────────────────────────────────
     def step(self, action: RlAgentAction) -> RlAgentObservation:
+        if not self._drug_configured:
+            raise RuntimeError(
+                "No drug configured. Submit a molecule via /drug before calling /step."
+            )
         self._state.step_count += 1
 
         # 1. Record previous dose before updating (used by reward)
@@ -391,8 +387,8 @@ class RlAgentEnvironment(Environment):
                 sex            = sex,
                 renal_factor   = random.uniform(0.7, 1.0),
                 hepatic_factor = random.uniform(0.7, 1.0),
-                drug_params    = self.drug_params   or None,  # ← Layer 1/2
-                safety_flags   = self.safety_flags  or None,  # ← Layer 1/2
+                drug_params    = self.drug_params,   # ← Layer 1/2 required
+                safety_flags   = self.safety_flags,  # ← Layer 1/2
             ))
         return patients
 
@@ -415,8 +411,8 @@ class RlAgentEnvironment(Environment):
             sex            = patient.sex,
             renal_factor   = patient.renal_factor,
             hepatic_factor = patient.hepatic_factor,
-            drug_params    = self.drug_params or None,
-            safety_flags   = self.safety_flags or None,
+            drug_params    = self.drug_params,
+            safety_flags   = self.safety_flags,
         )
         p.dose(dose)
         dt = hours / n_points
@@ -457,12 +453,28 @@ class RlAgentEnvironment(Environment):
             Output of DrugProfileBuilder.build() — contains drug_params,
             safety_flags, human_equivalent_dose, name, and admet_summary.
         """
-        self.drug_name    = drug_profile.get("name", "investigational compound")
-        self.drug_params  = drug_profile.get("drug_params",  {})
-        self.safety_flags = drug_profile.get("safety_flags", {})
-        hed = drug_profile.get("human_equivalent_dose", None)
-        self._start_dose  = round(max(0.1, hed / 10.0), 3) if (hed and hed > 0) else 1.0
+        required_top = {"name", "drug_params", "safety_flags", "human_equivalent_dose"}
+        missing_top = sorted(required_top.difference(drug_profile.keys()))
+        if missing_top:
+            raise ValueError(f"drug_profile missing required fields: {missing_top}")
+
+        required_pk = {"ka", "F", "CL", "Vc", "Vp", "Q", "PPB", "fu"}
+        params = drug_profile["drug_params"]
+        missing_pk = sorted(required_pk.difference(params.keys()))
+        if missing_pk:
+            raise ValueError(f"drug_params missing required fields: {missing_pk}")
+
+        hed = float(drug_profile["human_equivalent_dose"])
+        if hed <= 0:
+            raise ValueError("human_equivalent_dose must be > 0")
+
+        self.drug_name    = str(drug_profile["name"])
+        self.drug_params  = dict(params)
+        self.safety_flags = dict(drug_profile["safety_flags"])
+        self._drug_profile_hed = hed
+        self._start_dose  = round(max(0.1, hed / 10.0), 3)
         self.current_dose = self._start_dose
+        self._drug_configured = True
 
     def get_episode_data(self) -> dict:
         """

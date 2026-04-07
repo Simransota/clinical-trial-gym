@@ -31,6 +31,7 @@ Or via the HTTP API after the server is running:
 import os
 import sys
 import warnings
+import math
 
 # ── path: add Patient_Simulation so Layer 1+2 imports resolve ────────────────
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -103,8 +104,13 @@ class DrugProfileBuilder:
 
         # Layer 1: molecule → ADMET → drug profile
         mol       = DrugMolecule(self.smiles, name=self.name)
-        predictor = ADMETPredictor(cache=True)
+        predictor = ADMETPredictor(use_deepchem=True, cache=True)
         profile   = MolecularPropertyExtractor(predictor).extract(mol)
+        if profile.admet.source != "deepchem":
+            raise RuntimeError(
+                "DeepChem MolNet backend is required, but prediction did not use DeepChem. "
+                "Run setup_models.py with internet access and ensure DeepChem/TensorFlow are installed."
+            )
 
         # Layer 2: allometric scaling (source species → human)
         scaler      = AllometricScaler(self.source_species, self.target_species)
@@ -115,6 +121,23 @@ class DrugProfileBuilder:
         hed = scaler.scale_dose(self.animal_dose_mgkg)
 
         admet = profile.admet
+        debug_drug = os.getenv("DEBUG_DRUG", "0").lower() in ("1", "true", "yes")
+        if debug_drug:
+            print(f"[DEBUG] ADMET source={admet.source}", file=sys.stderr, flush=True)
+            print(
+                f"[DEBUG] Raw ADMET summary="
+                f"{{'F_oral': {admet.F_oral}, 'PPB': {admet.PPB}, 'BBB_probability': {admet.BBB_probability}, "
+                f"'predicted_logD': {admet.predicted_logD}, 'clintox_toxic_prob': {admet.clintox_toxic_prob}}}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print("[DEBUG] PK generation path=ADMETProperties.to_pkpd_params -> AllometricScaler.scale", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Derived PK pre-validation={human_params}", file=sys.stderr, flush=True)
+
+        self._validate_pk_params(human_params)
+        if debug_drug:
+            print("[DEBUG] PK validation=PASS", file=sys.stderr, flush=True)
+
         self._profile = {
             "name":   self.name,
             "smiles": self.smiles,
@@ -147,6 +170,44 @@ class DrugProfileBuilder:
             },
         }
         return self._profile
+
+    @staticmethod
+    def _validate_pk_params(params: dict) -> None:
+        required = {"ka", "F", "CL", "Vc", "Vp", "Q", "PPB", "fu"}
+        missing = sorted(required.difference(params.keys()))
+        if missing:
+            raise ValueError(f"PK validation failed: missing keys {missing}")
+
+        def _num(name: str) -> float:
+            v = params[name]
+            try:
+                x = float(v)
+            except Exception as exc:
+                raise ValueError(f"PK validation failed: {name} is non-numeric ({v!r})") from exc
+            if not math.isfinite(x):
+                raise ValueError(f"PK validation failed: {name} is non-finite ({x})")
+            return x
+
+        ka = _num("ka")
+        F = _num("F")
+        CL = _num("CL")
+        Vc = _num("Vc")
+        Vp = _num("Vp")
+        Q = _num("Q")
+        PPB = _num("PPB")
+        fu = _num("fu")
+
+        if not (0.0 < F <= 1.0):
+            raise ValueError(f"PK validation failed: F out of bounds ({F})")
+        if not (0.0 < fu <= 1.0):
+            raise ValueError(f"PK validation failed: fu out of bounds ({fu})")
+        if not (0.0 <= PPB <= 1.0):
+            raise ValueError(f"PK validation failed: PPB out of bounds ({PPB})")
+        if ka <= 0.0 or CL <= 0.0 or Vc <= 0.0 or Vp <= 0.0 or Q <= 0.0:
+            raise ValueError(
+                f"PK validation failed: expected ka/CL/Vc/Vp/Q > 0, got "
+                f"ka={ka}, CL={CL}, Vc={Vc}, Vp={Vp}, Q={Q}"
+            )
 
     @property
     def profile(self) -> dict:
