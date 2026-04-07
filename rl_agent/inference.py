@@ -411,17 +411,11 @@ def choose_dynamic_cohort_size(
 ) -> int:
     if dlt_count >= 1:
         return 6
-    if boundary_detected:
-        return 6
-    if worsening_risk > 0.03:
-        return 6
-    if risk > 0.45:
-        return 6
-    if near_target and (risk > 0.25 or hed_ratio > 1.2):
-        return 6
-    if task_name == "combo_ddi" and hed_ratio > 1.1:
-        return 6
-    return 3
+    if hed_ratio < 0.8:
+        return 3
+    if hed_ratio < 1.2:
+        return 6 if worsening_risk > 0.05 else 3
+    return 6
 
 
 def choose_action(
@@ -469,12 +463,11 @@ def choose_action(
     hed_ratio = current_dose / max(hed, 1e-6)
     near_target = ratio >= 0.8
 
-    # Boundary region between clearly safe and clearly toxic dosing.
+    # Delayed/confirmed boundary detection to avoid early over-triggering.
     boundary_detected = (
-        (worsening_risk > 0.03)
-        or (risk > 0.22 and worsening_risk > 0.0)
-        or (1.2 <= hed_ratio <= 2.0)
-        or (safe_streak >= 2 and reward_delta <= 0.0)
+        (hed_ratio >= 1.2)
+        or (worsening_risk > 0.05)
+        or (dlt_count >= 1)
     )
 
     dynamic_cohort = choose_dynamic_cohort_size(
@@ -486,6 +479,13 @@ def choose_action(
         near_target=near_target,
         boundary_detected=boundary_detected,
     )
+
+    # Early safe zone override: accelerate with 3-patient cohorts.
+    if hed_ratio < 0.8 and dlt_count == 0:
+        low, high = cfg["far_mult"]
+        early_factor = high if safe_streak >= 1 else (low + high) / 2.0
+        next_dose = min(50.0, max(0.1, current_dose * early_factor))
+        return {"next_dose": round(next_dose, 4), "cohort_size": 3, "escalate": True}
 
     # Hard safety gates
     if dlt_count >= 2 or dlt_rate > 0.33:
@@ -503,6 +503,12 @@ def choose_action(
         align_tol = float(cfg.get("align_tolerance", 0.12))
         if abs(first - target) / max(target, 1e-6) <= align_tol:
             return {"next_dose": round(current_dose, 4), "cohort_size": 3, "escalate": False}
+        # If not perfectly aligned on step 1, settle toward HED once, then stop oscillation.
+        if len(prev_actions) >= 1:
+            settle = min(target, current_dose * 1.08)
+            if hed_ratio >= 1.0 or worsening_risk > 0.02:
+                settle = min(settle, current_dose)
+            return {"next_dose": round(settle, 4), "cohort_size": 6 if worsening_risk > 0.03 else 3, "escalate": False}
 
     # DDI-aware modulation for combo task.
     ddi_sensitive = task_name == "combo_ddi" and ("CYP3A4" in set(cyp_inhibitions))
@@ -536,8 +542,13 @@ def choose_action(
     # Boundary-aware control: move into cautious refinement and avoid large jumps.
     if boundary_detected and task_name != "allometric_scaling":
         low, high = cfg["near_mult"]
-        boundary_cap = min((low + high) / 2.0, 1.18)
+        boundary_cap = min((low + high) / 2.0, 1.25)
         up_factor = min(up_factor, boundary_cap)
+
+    # Mid-zone controlled escalation (0.8x-1.2x HED): moderate steps, not crawl and not jumps.
+    if 0.8 <= hed_ratio < 1.2 and task_name != "allometric_scaling":
+        low, high = cfg["near_mult"]
+        up_factor = min(up_factor, (low + high) / 2.0)
 
     # HED-relative guardrails:
     # - phase_i_dosing: above ~1.75x HED, suppress far-band high-end catch-up
@@ -548,6 +559,12 @@ def choose_action(
     if task_name == "combo_ddi" and hed_ratio > 1.35:
         low, high = cfg["near_mult"] if ratio >= 0.8 else cfg["mid_mult"]
         up_factor = min(up_factor, (low + high) / 2.0)
+
+    # Overshoot brake: once uncertainty evidence is high (cohort=6 or rising risk),
+    # prevent large jumps regardless of nominal task band.
+    if task_name in ("phase_i_dosing", "combo_ddi"):
+        if dynamic_cohort == 6 or worsening_risk > 0.03:
+            up_factor = min(up_factor, 1.12 if hed_ratio < 1.2 else 1.08)
 
     # Reduce aggressiveness when approaching boundaries
     if risk > cfg["max_safe_risk"] or worsening_risk > 0.05:
@@ -569,9 +586,15 @@ def choose_action(
 
     # Extra hard cap against single-step overshoot in boundary region.
     if boundary_detected and task_name != "allometric_scaling":
-        next_dose = min(next_dose, current_dose * 1.18)
+        next_dose = min(next_dose, current_dose * 1.25)
         # If risk is actively worsening near/above HED region, prefer hold with larger cohort.
         if worsening_risk > 0.04 and hed_ratio >= 1.2:
+            next_dose = current_dose
+
+    # Additional cross-drug crash prevention:
+    # if risk is not improving and dose already above HED region, hold rather than jump.
+    if task_name in ("phase_i_dosing", "combo_ddi"):
+        if hed_ratio >= 1.25 and worsening_risk > 0.02 and dynamic_cohort == 6:
             next_dose = current_dose
 
     # Anti-oscillation / repetition guard: nudge if repeating same dose
@@ -590,7 +613,7 @@ def choose_action(
         next_dose = min(50.0, max(next_dose, current_dose * 1.35))
     if task_name == "combo_ddi" and len(prev_actions) >= max(4, int(0.7 * MAX_STEPS)):
         catchup_mult = float(cfg.get("late_catchup_mult", 1.2))
-        if ratio < late_ratio and risk < 0.30 and dlt_count == 0 and hed_ratio <= 1.5:
+        if ratio < late_ratio and risk < 0.28 and dlt_count == 0 and hed_ratio <= 1.35:
             next_dose = min(50.0, max(next_dose, current_dose * catchup_mult))
 
     # Phase I refinement/stop near RP2D band to reduce overshoot.
