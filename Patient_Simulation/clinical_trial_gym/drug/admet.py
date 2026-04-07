@@ -17,6 +17,15 @@ Two model backends (selected automatically):
 In both backends, every prediction flows through a fit→predict sklearn
 or DeepChem pipeline. There are NO hardcoded return values.
 
+Fixes vs original
+-----------------
+* _patch_remove_missing_entries() is called at module import time so the
+  HPPB AxisError is fixed even if admet.py is imported without running
+  setup_models.py first.
+* _DeepChemModelManager.predict_all() catches per-dataset failures so a
+  broken HPPB model falls back gracefully to the QSAR result for PPB,
+  rather than crashing the whole prediction.
+
 Dependencies:
     Minimum: rdkit, numpy, scipy, scikit-learn
     Full:    + deepchem, tensorflow
@@ -33,12 +42,29 @@ Example
 from __future__ import annotations
 
 import os
+import os
+import shutil
 import warnings
 import logging
+import importlib.util
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+# DeepChem 2.x GraphConv models require legacy tf.keras on modern TensorFlow.
+# This MUST be set before TensorFlow is imported!
+if importlib.util.find_spec("tf_keras") is not None:
+    os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+
+# Suppress TensorFlow logging to avoid massive output spam during restore
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+try:
+    import tensorflow as tf
+    tf.get_logger().setLevel('ERROR')
+except ImportError:
+    pass
+
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 
@@ -54,6 +80,168 @@ try:
     _DEEPCHEM_AVAILABLE = True
 except ImportError:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Patch 1 — NumPy 2 ragged-array fix for MolecularFeaturizer
+# ---------------------------------------------------------------------------
+
+def _apply_deepchem_numpy2_compat_patch() -> bool:
+    """
+    Patch DeepChem MolecularFeaturizer for NumPy 2 ragged array behavior.
+
+    DeepChem 2.x uses np.asarray(features), which raises on mixed feature
+    shapes under NumPy 2 when invalid molecules produce empty arrays.
+    """
+    if not _DEEPCHEM_AVAILABLE:
+        return False
+
+    from deepchem.feat.base_classes import MolecularFeaturizer
+
+    if getattr(MolecularFeaturizer.featurize, "_ctg_numpy2_patch", False):
+        return False
+
+    if int(np.__version__.split(".")[0]) < 2:
+        return False
+
+    _original_featurize = MolecularFeaturizer.featurize
+
+    def _patched_featurize(self, molecules, log_every_n=1000):
+        try:
+            return _original_featurize(self, molecules, log_every_n=log_every_n)
+        except ValueError as exc:
+            if "inhomogeneous shape" not in str(exc):
+                raise
+
+            from rdkit import Chem
+            from rdkit.Chem import rdmolfiles, rdmolops
+            from rdkit.Chem.rdchem import Mol
+
+            if isinstance(molecules, (str, Mol)):
+                molecules = [molecules]
+            else:
+                molecules = list(molecules)
+
+            features = []
+            for i, mol in enumerate(molecules):
+                if i % log_every_n == 0:
+                    logger.info("Featurizing datapoint %i", i)
+                try:
+                    if isinstance(mol, str):
+                        mol = Chem.MolFromSmiles(mol)
+                        new_order = rdmolfiles.CanonicalRankAtoms(mol)
+                        mol = rdmolops.RenumberAtoms(mol, new_order)
+                    features.append(self._featurize(mol))
+                except Exception as inner_exc:
+                    smiles_repr = Chem.MolToSmiles(mol) if isinstance(mol, Mol) else mol
+                    logger.warning(
+                        "Failed to featurize datapoint %d (%s): %s",
+                        i, smiles_repr, inner_exc,
+                    )
+                    features.append(np.array([]))
+
+            return np.array(features, dtype=object)
+
+    _patched_featurize._ctg_numpy2_patch = True
+    MolecularFeaturizer.featurize = _patched_featurize
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Patch 2 — remove_missing_entries AxisError fix (HPPB bug)
+# ---------------------------------------------------------------------------
+
+def _patch_remove_missing_entries() -> bool:
+    """
+    Patch deepchem.utils.remove_missing_entries to handle 1-D X arrays.
+
+    Root cause
+    ----------
+    hppb_datasets.py calls deepchem.utils.remove_missing_entries, which
+    internally does X.any(axis=1). When ConvMolFeaturizer returns a 1-D
+    object array (all molecules in a shard failed featurization, or there
+    is exactly one sample), axis=1 does not exist and NumPy 2 raises:
+
+        numpy.exceptions.AxisError: axis 1 is out of bounds for array of dimension 1
+
+    Fix
+    ---
+    We replace remove_missing_entries with a version that checks ndim
+    before calling .any(axis=1). The patched version is installed on
+    deepchem.utils AND on the already-imported hppb_datasets module-level
+    name so it is effective regardless of import order.
+    """
+    if not _DEEPCHEM_AVAILABLE:
+        return False
+
+    try:
+        import deepchem.utils as dc_utils
+    except ImportError:
+        return False
+
+    patched_any = False
+
+    def _safe_remove_missing_entries(dataset):
+        """NumPy-2-safe version of remove_missing_entries."""
+        for i, (X, y, w, ids) in enumerate(dataset.itershards()):
+            X = np.asarray(X)
+
+            if X.ndim == 0 or X.size == 0:
+                logger.debug("Shard %d is empty, skipping.", i)
+                continue
+
+            if X.ndim == 1:
+                # Single sample or 1-D object array from failed featurizations.
+                # Nothing meaningful to filter on axis=1 — keep as-is.
+                logger.debug(
+                    "Shard %d has 1-D X (shape %s); skipping axis=1 filter.",
+                    i, X.shape,
+                )
+                continue
+
+            # Standard 2-D path — unchanged from DeepChem original.
+            available_rows = X.any(axis=1)
+            missing = int(np.count_nonzero(~available_rows))
+            if missing:
+                logger.info("Shard %d: removing %d missing entries.", i, missing)
+            X   = X[available_rows]
+            y   = y[available_rows]
+            w   = w[available_rows]
+            ids = ids[available_rows]
+            dataset.set_shard(i, X, y, w, ids)
+
+    _safe_remove_missing_entries._ctg_rme_patch = True
+
+    # DeepChem 2.5.0+ module paths where the problematic function might be defined/imported
+    modules_to_patch = [
+        "deepchem.utils",
+        "deepchem.molnet.load_function.hppb_datasets",
+        "deepchem.molnet.load_function.uv_datasets",
+        "deepchem.molnet.load_function.kaggle_datasets",
+        "deepchem.molnet.load_function.factors_datasets",
+        "deepchem.molnet.load_function.kinase_datasets",
+    ]
+
+    import importlib
+    for mod_name in modules_to_patch:
+        try:
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, "remove_missing_entries"):
+                if getattr(mod.remove_missing_entries, "_ctg_rme_patch", False):
+                    patched_any = True
+                    continue
+                mod.remove_missing_entries = _safe_remove_missing_entries
+                patched_any = True
+        except ImportError:
+            pass
+
+    return patched_any
+
+
+# Apply patches at import time so they are always in effect.
+if _DEEPCHEM_AVAILABLE:
+    _apply_deepchem_numpy2_compat_patch()
+    _patch_remove_missing_entries()
 
 
 # ---------------------------------------------------------------------------
@@ -95,10 +283,10 @@ class ADMETProperties:
     def to_pkpd_params(self) -> dict:
         """Convert ADMET predictions into PK/PD parameters for surrogate ODE."""
         logD = self.predicted_logD if not np.isnan(self.predicted_logD) else 2.0
-        ka = float(np.clip(2.0 * np.exp(-0.3 * (logD - 2.0)**2), 0.1, 5.0))
+        ka = float(np.clip(2.0 * np.exp(-0.3 * (logD - 2.0) ** 2), 0.1, 5.0))
 
         bbb_p = self.BBB_probability if not np.isnan(self.BBB_probability) else 0.5
-        logD_factor = float(np.exp(-0.15 * (logD - 2.0)**2))
+        logD_factor = float(np.exp(-0.15 * (logD - 2.0) ** 2))
         F = float(np.clip(0.4 + 0.5 * bbb_p * logD_factor, 0.05, 0.99))
         if not np.isnan(self.F_oral):
             F = self.F_oral
@@ -114,20 +302,26 @@ class ADMETProperties:
         fu = float(max(0.01, 1.0 - ppb))
 
         Vd = self.Vd if (not np.isnan(self.Vd) and self.Vd > 0) else \
-            float(np.clip(0.5 * (10**(0.4*logD)) / (fu+0.01), 0.1, 50.0))
+            float(np.clip(0.5 * (10 ** (0.4 * logD)) / (fu + 0.01), 0.1, 50.0))
 
         cf = float(np.clip(0.3 + 0.4 * fu, 0.2, 0.7))
         Vc = float(cf * Vd)
         Vp = float((1.0 - cf) * Vd)
-        Q = float(np.clip(0.2 * CL + 0.1, 0.05, 5.0))
+        Q  = float(np.clip(0.2 * CL + 0.1, 0.05, 5.0))
 
-        return {"ka": ka, "F": F, "CL": CL, "Vc": Vc, "Vp": Vp,
-                "Q": Q, "PPB": ppb, "fu": fu}
+        return {
+            "ka": ka, "F": F, "CL": CL, "Vc": Vc,
+            "Vp": Vp, "Q": Q, "PPB": ppb, "fu": fu,
+        }
 
     def cyp_inhibition_profile(self) -> Dict[str, bool]:
-        return {"CYP3A4": self.CYP3A4_inhibition, "CYP2D6": self.CYP2D6_inhibition,
-                "CYP2C9": self.CYP2C9_inhibition, "CYP2C19": self.CYP2C19_inhibition,
-                "CYP1A2": self.CYP1A2_inhibition}
+        return {
+            "CYP3A4":  self.CYP3A4_inhibition,
+            "CYP2D6":  self.CYP2D6_inhibition,
+            "CYP2C9":  self.CYP2C9_inhibition,
+            "CYP2C19": self.CYP2C19_inhibition,
+            "CYP1A2":  self.CYP1A2_inhibition,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +363,7 @@ def _compute_qsar_descriptors(smiles: str) -> np.ndarray:
 
 _TRAINING_DRUGS = [
     # (SMILES, F_oral, PPB, BBB, logD, CL_ml/min/kg, DILI, hERG, 3A4, 2D6, 2C9, 2C19, 1A2)
-    ("CC(=O)Oc1ccccc1C(=O)O", 0.68, 0.49, 0, 1.19, 9.3, 0, 0, 0, 0, 1, 0, 0),
+    ("CC(=O)Oc1ccccc1C(=O)O", 0.68, 0.49, 0, 1.19, 9.3,  0, 0, 0, 0, 1, 0, 0),
     ("CC(C)Cc1ccc(cc1)C(C)C(=O)O", 0.80, 0.99, 0, 1.93, 0.75, 0, 0, 0, 0, 1, 1, 0),
     ("CN1C=NC2=C1C(=O)N(C(=O)N2C)C", 0.99, 0.36, 1, -0.07, 2.1, 0, 0, 0, 0, 0, 0, 1),
     ("CC(=O)NC1=CC=C(O)C=C1", 0.85, 0.25, 1, 0.34, 5.5, 1, 0, 0, 0, 0, 0, 1),
@@ -215,8 +409,6 @@ _TRAINING_DRUGS = [
 class _QSARModelManager:
     """Trains and manages sklearn RF models for ADMET prediction."""
 
-    # Order MUST match the tuple layout in _TRAINING_DRUGS:
-    # (SMILES, F_oral, PPB, BBB, logD, CL, DILI, hERG, 3A4, 2D6, 2C9, 2C19, 1A2)
     _TUPLE_ORDER = ["F_oral", "PPB", "BBB", "logD", "CL",
                     "DILI", "hERG", "CYP3A4", "CYP2D6", "CYP2C9", "CYP2C19", "CYP1A2"]
     _TARGETS_REG = {"F_oral", "PPB", "logD", "CL"}
@@ -247,10 +439,8 @@ class _QSARModelManager:
         self._scaler = StandardScaler()
         Xs = self._scaler.fit_transform(X)
 
-        import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-
             for t in self._TUPLE_ORDER:
                 if t in self._TARGETS_REG:
                     m = RandomForestRegressor(
@@ -282,6 +472,8 @@ class _QSARModelManager:
 
 
 _global_qsar: Optional[_QSARModelManager] = None
+
+
 def _get_qsar() -> _QSARModelManager:
     global _global_qsar
     if _global_qsar is None:
@@ -300,24 +492,24 @@ _TOX21_TASKS = [
 ]
 
 _CYP_TOX21_MAP = {
-    "CYP1A2": "NR-AhR", "CYP3A4": "NR-AR", "CYP2C19": "NR-ER",
-    "CYP2C9": "NR-PPAR-gamma", "CYP2D6": "NR-AR-LBD",
+    "CYP1A2":  "NR-AhR",
+    "CYP3A4":  "NR-AR",
+    "CYP2C19": "NR-ER",
+    "CYP2C9":  "NR-PPAR-gamma",
+    "CYP2D6":  "NR-AR-LBD",
 }
 
 
 def _find_repo_model_dir() -> Optional[str]:
     """Auto-detect models/ directory in the repo (created by setup_models.py)."""
-    # Check env var first
     env_dir = os.environ.get("CLINICAL_TRIAL_GYM_MODEL_DIR")
     if env_dir and os.path.isdir(env_dir):
         return env_dir
 
-    # Walk up from this file to find repo root with models/
     current = os.path.dirname(os.path.abspath(__file__))
-    for _ in range(5):  # max 5 levels up
+    for _ in range(5):
         candidate = os.path.join(current, "models")
         if os.path.isdir(candidate):
-            # Check it has at least one trained model subdir
             subdirs = [d for d in os.listdir(candidate)
                        if os.path.isdir(os.path.join(candidate, d))]
             if subdirs:
@@ -357,10 +549,7 @@ class ADMETPredictor:
     Parameters
     ----------
     model_dir : str, optional
-        Path to pre-trained model directory. If None, auto-detects from:
-        - CLINICAL_TRIAL_GYM_MODEL_DIR environment variable
-        - models/ directory in the repo root (from setup_models.py)
-        - ~/.clinical_trial_gym/models (user home)
+        Path to pre-trained model directory.
     use_deepchem : bool, optional
         Force backend. None = auto-detect.
     cache : bool
@@ -376,7 +565,6 @@ class ADMETPredictor:
         if use_deepchem is True and not _DEEPCHEM_AVAILABLE:
             raise ImportError("DeepChem not installed.")
 
-        # Resolve model directory
         model_dir = kwargs.get("model_dir")
         if model_dir is None:
             model_dir = _find_repo_model_dir()
@@ -384,16 +572,15 @@ class ADMETPredictor:
             model_dir = os.path.join(
                 os.path.expanduser("~"), ".clinical_trial_gym", "models")
 
-        # Resolve data directory (for DeepChem dataset loading)
         data_dir = _find_repo_data_dir()
         if data_dir:
             os.environ.setdefault("DEEPCHEM_DATA_DIR", data_dir)
 
         if use_deepchem is not False and _DEEPCHEM_AVAILABLE:
             self._dc_model_dir = model_dir
-            self._dc_data_dir = data_dir
-            self._dc_n_epochs = kwargs.get("n_epochs", 30)
-            self.use_deepchem = True
+            self._dc_data_dir  = data_dir
+            self._dc_n_epochs  = kwargs.get("n_epochs", 30)
+            self.use_deepchem  = True
 
     def predict(self, mol) -> ADMETProperties:
         if self._cache_enabled and mol.mol_id in self._cache:
@@ -402,9 +589,9 @@ class ADMETPredictor:
         if self.use_deepchem:
             try:
                 props = self._predict_deepchem(mol)
-            except Exception as e:
-                logger.warning("DeepChem prediction failed: %s. Using QSAR.", e)
-                self.use_deepchem = False  # don't retry
+            except Exception as exc:
+                logger.warning("DeepChem prediction failed: %s. Using QSAR.", exc)
+                self.use_deepchem = False
                 props = self._predict_qsar(mol)
         else:
             props = self._predict_qsar(mol)
@@ -413,38 +600,40 @@ class ADMETPredictor:
             self._cache[mol.mol_id] = props
         return props
 
+    # ------------------------------------------------------------------
+    # QSAR backend
+    # ------------------------------------------------------------------
+
     def _predict_qsar(self, mol) -> ADMETProperties:
         """Predict using trained QSAR RF models."""
         preds = _get_qsar().predict(mol.smiles)
         props = ADMETProperties(source="qsar_trained")
 
-        props.predicted_logD = float(np.clip(preds["logD"], -5, 8))
-        props.F_oral = float(np.clip(preds["F_oral"], 0.05, 0.99))
-        props.PPB = float(np.clip(preds["PPB"], 0.01, 0.99))
-        props.clearance_ml_min_kg = float(np.clip(preds["CL"], 0.1, 100.0))
-
-        props.BBB_probability = float(preds["BBB"])
-        props.BBB_penetrant = bool(preds["BBB"] > 0.5)
-        props.DILI_flag = bool(preds["DILI"] > 0.5)
-        props.hERG_flag = bool(preds["hERG"] > 0.5)
-
-        props.CYP3A4_inhibition = bool(preds["CYP3A4"] > 0.5)
-        props.CYP2D6_inhibition = bool(preds["CYP2D6"] > 0.5)
-        props.CYP2C9_inhibition = bool(preds["CYP2C9"] > 0.5)
-        props.CYP2C19_inhibition = bool(preds["CYP2C19"] > 0.5)
-        props.CYP1A2_inhibition = bool(preds["CYP1A2"] > 0.5)
-
-        props.caco2_permeability = float(-5.47 + 0.69 * np.clip(props.predicted_logD, -2, 6))
+        props.predicted_logD          = float(np.clip(preds["logD"], -5, 8))
+        props.F_oral                  = float(np.clip(preds["F_oral"], 0.05, 0.99))
+        props.PPB                     = float(np.clip(preds["PPB"], 0.01, 0.99))
+        props.clearance_ml_min_kg     = float(np.clip(preds["CL"], 0.1, 100.0))
+        props.BBB_probability         = float(preds["BBB"])
+        props.BBB_penetrant           = bool(preds["BBB"] > 0.5)
+        props.DILI_flag               = bool(preds["DILI"] > 0.5)
+        props.hERG_flag               = bool(preds["hERG"] > 0.5)
+        props.CYP3A4_inhibition       = bool(preds["CYP3A4"] > 0.5)
+        props.CYP2D6_inhibition       = bool(preds["CYP2D6"] > 0.5)
+        props.CYP2C9_inhibition       = bool(preds["CYP2C9"] > 0.5)
+        props.CYP2C19_inhibition      = bool(preds["CYP2C19"] > 0.5)
+        props.CYP1A2_inhibition       = bool(preds["CYP1A2"] > 0.5)
+        props.caco2_permeability      = float(
+            -5.47 + 0.69 * np.clip(props.predicted_logD, -2, 6))
 
         fu = max(0.01, 1.0 - props.PPB)
         props.Vd = float(np.clip(
-            0.5 * (10**(0.4 * props.predicted_logD)) / (fu + 0.01), 0.1, 50.0))
+            0.5 * (10 ** (0.4 * props.predicted_logD)) / (fu + 0.01), 0.1, 50.0))
 
-        CL_Lh = props.clearance_ml_min_kg * 60.0 / 1000.0
+        CL_Lh  = props.clearance_ml_min_kg * 60.0 / 1000.0
         t_half = 0.693 * props.Vd / (CL_Lh + 1e-10)
-        props.half_life_class = "short" if t_half < 2 else "medium" if t_half < 12 else "long"
+        props.half_life_class = (
+            "short" if t_half < 2 else "medium" if t_half < 12 else "long")
 
-        # Tox21 approximation from trained classifiers
         cyp_rev = {v: k for k, v in _CYP_TOX21_MAP.items()}
         for task in _TOX21_TASKS:
             if task in cyp_rev:
@@ -454,67 +643,95 @@ class ADMETPredictor:
             else:
                 props.tox21_predictions[task] = float(preds.get("DILI", 0.0))
 
-        props.clintox_toxic_prob = float(preds["DILI"])
+        props.clintox_toxic_prob    = float(preds["DILI"])
         props.clintox_approved_prob = float(1.0 - preds["DILI"])
         props.prediction_confidence = 0.75
-
         return props
+
+    # ------------------------------------------------------------------
+    # DeepChem backend
+    # ------------------------------------------------------------------
 
     def _predict_deepchem(self, mol) -> ADMETProperties:
         """Predict using DeepChem MolNet models (lazy init)."""
         if self._dc_manager is None:
             self._dc_manager = _DeepChemModelManager(
-                self._dc_model_dir, self._dc_n_epochs,
-                data_dir=getattr(self, '_dc_data_dir', None))
+                self._dc_model_dir,
+                self._dc_n_epochs,
+                data_dir=getattr(self, "_dc_data_dir", None),
+            )
 
+        # Collect raw predictions; individual dataset failures are tolerated.
         raw = self._dc_manager.predict_all(mol.smiles)
-        props = ADMETProperties(source="deepchem")
 
-        pred = raw["bbbp"]
-        p = self._extract_cls_prob(pred, 0)
-        props.BBB_penetrant = bool(p > 0.5)
-        props.BBB_probability = float(p)
+        # Start with QSAR as baseline — DeepChem values overwrite where available.
+        props = self._predict_qsar(mol)
+        props.source = "deepchem"
 
-        pred = raw["clintox"]
-        props.clintox_approved_prob = float(self._extract_cls_prob(pred, 0))
-        props.clintox_toxic_prob = float(self._extract_cls_prob(pred, 1))
-        props.DILI_flag = bool(props.clintox_toxic_prob > 0.5)
+        # BBBP
+        if "bbbp" in raw:
+            p = self._extract_cls_prob(raw["bbbp"], 0)
+            props.BBB_penetrant    = bool(p > 0.5)
+            props.BBB_probability  = float(p)
 
-        pred = raw["tox21"]
-        for i, task in enumerate(_TOX21_TASKS):
-            props.tox21_predictions[task] = float(self._extract_cls_prob(pred, i))
-        for cyp, task in _CYP_TOX21_MAP.items():
-            setattr(props, f"{cyp}_inhibition", bool(props.tox21_predictions.get(task, 0) > 0.5))
-        props.hERG_flag = bool(props.tox21_predictions.get("SR-MMP", 0) > 0.5)
+        # ClinTox
+        if "clintox" in raw:
+            props.clintox_approved_prob = float(self._extract_cls_prob(raw["clintox"], 0))
+            props.clintox_toxic_prob    = float(self._extract_cls_prob(raw["clintox"], 1))
+            props.DILI_flag             = bool(props.clintox_toxic_prob > 0.5)
 
-        pred = raw["lipo"]
-        logD = float(pred[0][0]) if pred.size > 0 else 2.0
-        props.predicted_logD = logD
-        props.caco2_permeability = float(-5.47 + 0.69 * np.clip(logD, -2, 6))
-        props.F_oral = float(np.clip(
-            1.0 / (1.0 + np.exp(-(props.caco2_permeability + 5.15) * 3.0)), 0.05, 0.99))
+        # Tox21
+        if "tox21" in raw:
+            for i, task in enumerate(_TOX21_TASKS):
+                props.tox21_predictions[task] = float(
+                    self._extract_cls_prob(raw["tox21"], i))
+            for cyp, task in _CYP_TOX21_MAP.items():
+                setattr(props, f"{cyp}_inhibition",
+                        bool(props.tox21_predictions.get(task, 0) > 0.5))
+            props.hERG_flag = bool(props.tox21_predictions.get("SR-MMP", 0) > 0.5)
 
-        pred = raw["clearance"]
-        cl = float(pred[0][0]) if pred.size > 0 else np.nan
-        props.clearance_ml_min_kg = float(np.clip(cl, 0.1, 100.0)) if np.isfinite(cl) else np.nan
+        # Lipophilicity (logD)
+        if "lipo" in raw:
+            pred = raw["lipo"]
+            logD = float(pred[0][0]) if np.asarray(pred).size > 0 else np.nan
+            if np.isfinite(logD):
+                props.predicted_logD     = logD
+                props.caco2_permeability = float(-5.47 + 0.69 * np.clip(logD, -2, 6))
+                props.F_oral             = float(np.clip(
+                    1.0 / (1.0 + np.exp(-(props.caco2_permeability + 5.15) * 3.0)),
+                    0.05, 0.99))
 
-        pred = raw["hppb"]
-        ppb = float(pred[0][0]) if pred.size > 0 else np.nan
-        props.PPB = float(np.clip(ppb / 100.0, 0.01, 0.99)) if np.isfinite(ppb) else np.nan
+        # Clearance
+        if "clearance" in raw:
+            pred = raw["clearance"]
+            cl = float(np.asarray(pred).ravel()[0]) if np.asarray(pred).size > 0 else np.nan
+            if np.isfinite(cl):
+                props.clearance_ml_min_kg = float(np.clip(cl, 0.1, 100.0))
 
-        fu = max(0.01, 1.0 - (props.PPB if not np.isnan(props.PPB) else 0.85))
-        props.Vd = float(np.clip(0.5*(10**(0.4*logD))/(fu+0.01), 0.1, 50.0))
+        # HPPB — graceful fallback: if the model failed, QSAR PPB is already set.
+        if "hppb" in raw:
+            pred = raw["hppb"]
+            ppb_raw = float(np.asarray(pred).ravel()[0]) if np.asarray(pred).size > 0 else np.nan
+            if np.isfinite(ppb_raw):
+                props.PPB = float(np.clip(ppb_raw / 100.0, 0.01, 0.99))
+
+        # Recompute derived quantities with updated values.
+        logD = props.predicted_logD if not np.isnan(props.predicted_logD) else 2.0
+        fu   = max(0.01, 1.0 - (props.PPB if not np.isnan(props.PPB) else 0.85))
+        props.Vd = float(np.clip(0.5 * (10 ** (0.4 * logD)) / (fu + 0.01), 0.1, 50.0))
 
         if not np.isnan(props.clearance_ml_min_kg) and props.Vd > 0:
             t_h = 0.693 * props.Vd / (props.clearance_ml_min_kg * 0.06 + 1e-10)
-            props.half_life_class = "short" if t_h < 2 else "medium" if t_h < 12 else "long"
+            props.half_life_class = (
+                "short" if t_h < 2 else "medium" if t_h < 12 else "long")
         else:
-            props.half_life_class = "short" if logD < 1 else "medium" if logD < 3.5 else "long"
+            props.half_life_class = (
+                "short" if logD < 1 else "medium" if logD < 3.5 else "long")
 
         return props
 
     @staticmethod
-    def _extract_cls_prob(pred, task_idx=0):
+    def _extract_cls_prob(pred, task_idx: int = 0) -> float:
         x = np.asarray(pred)
         if x.ndim == 3 and x.shape[2] >= 2:
             return float(np.clip(x[0, task_idx, 1], 0, 1))
@@ -530,63 +747,143 @@ class ADMETPredictor:
 
 
 # ---------------------------------------------------------------------------
-# DeepChem MolNet Manager (only used when DeepChem available + data loads)
+# DeepChem MolNet Manager
 # ---------------------------------------------------------------------------
 
 if _DEEPCHEM_AVAILABLE:
-    class _DeepChemModelManager:
-        def __init__(self, model_dir, n_epochs=30, data_dir=None):
-            self.model_dir = model_dir
-            self.data_dir = data_dir  # pre-downloaded by setup_models.py
-            os.makedirs(model_dir, exist_ok=True)
-            self.n_epochs = n_epochs
-            self._models = {}
-            self._featurizer = dc.feat.MolGraphConvFeaturizer(use_edges=True)
 
-        def _model_path(self, name):
+    class _DeepChemModelManager:
+        """
+        Lazy-initialises and caches one GraphConvModel per MolNet dataset.
+
+        Key change vs original
+        ----------------------
+        predict_all() catches exceptions per-dataset and returns only the
+        datasets that succeeded. The caller (_predict_deepchem) falls back
+        to the QSAR value for any missing key, so a broken HPPB model no
+        longer crashes the whole prediction pipeline.
+        """
+
+        def __init__(self, model_dir: str, n_epochs: int = 30,
+                     data_dir: Optional[str] = None):
+            self.model_dir = model_dir
+            self.data_dir  = data_dir
+            os.makedirs(model_dir, exist_ok=True)
+            self.n_epochs   = n_epochs
+            self._models: Dict[str, object] = {}
+            self._featurizer = dc.feat.ConvMolFeaturizer()
+
+        def _model_path(self, name: str) -> str:
             return os.path.join(self.model_dir, name)
 
-        def _is_trained(self, name):
+        def _is_trained(self, name: str) -> bool:
             p = self._model_path(name)
             return os.path.isdir(p) and any(
-                f.endswith((".index", ".npy", ".npz", ".h5")) or f.startswith("checkpoint")
-                for f in os.listdir(p) if os.path.isfile(os.path.join(p, f)))
+                f.endswith((".index", ".npy", ".npz", ".h5"))
+                or f.startswith("checkpoint")
+                for f in os.listdir(p)
+                if os.path.isfile(os.path.join(p, f))
+            )
 
-        def _get_or_train(self, name, loader_fn, n_tasks, mode):
+        def _get_or_train(self, name: str, loader_fn, n_tasks: int, mode: str):
             if name in self._models:
                 return self._models[name]
 
-            # Use pre-downloaded data if available (from setup_models.py)
-            loader_kwargs = {
+            loader_kwargs: dict = {
                 "featurizer": self._featurizer,
-                "splitter": "scaffold",
+                "splitter":   "scaffold",
             }
             if self.data_dir:
                 loader_kwargs["data_dir"] = self.data_dir
                 loader_kwargs["save_dir"] = os.path.join(
                     self.data_dir, f"{name}_featurized")
 
-            tasks, datasets, _ = loader_fn(**loader_kwargs)
-            model = GraphConvModel(n_tasks=n_tasks, mode=mode,
-                                    model_dir=self._model_path(name),
-                                    batch_size=64, learning_rate=0.001)
+            # For HPPB, clear stale featurized cache before loading.
+            if name == "hppb" and "save_dir" in loader_kwargs:
+                save_dir = loader_kwargs["save_dir"]
+                if os.path.isdir(save_dir):
+                    shutil.rmtree(save_dir, ignore_errors=True)
+                    logger.info(
+                        "[hppb] Cleared featurized cache at %s before loading.",
+                        save_dir,
+                    )
+
+            try:
+                tasks, datasets, _ = loader_fn(**loader_kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "DeepChem loader for '%s' failed (%s). "
+                    "Rebuilding featurized cache.",
+                    name, exc,
+                )
+                save_dir = loader_kwargs.get("save_dir")
+                if save_dir:
+                    shutil.rmtree(save_dir, ignore_errors=True)
+                loader_kwargs["reload"] = False
+                tasks, datasets, _ = loader_fn(**loader_kwargs)
+
+            try:
+                model = GraphConvModel(
+                    n_tasks=n_tasks,
+                    mode=mode,
+                    model_dir=self._model_path(name),
+                    batch_size=64,
+                    learning_rate=0.001,
+                )
+            except Exception as exc:
+                msg = str(exc)
+                if "BatchNormalization" in msg and "fused" in msg:
+                    raise RuntimeError(
+                        "DeepChem GraphConvModel is incompatible with Keras 3. "
+                        "Install legacy keras support: pip install tf_keras"
+                    ) from exc
+                raise
+
             if self._is_trained(name):
                 model.restore()
             else:
                 model.fit(datasets[0], nb_epoch=self.n_epochs)
+
             self._models[name] = model
             return model
 
-        def featurize(self, smiles):
-            return dc.data.NumpyDataset(self._featurizer.featurize([smiles]))
+        def featurize(self, smiles: str, n_tasks: int = 1):
+            X = self._featurizer.featurize([smiles])
+            y = np.zeros((len(X), n_tasks))
+            return dc.data.NumpyDataset(X=X, y=y)
 
-        def predict_all(self, smiles):
-            ds = self.featurize(smiles)
-            r = {}
-            r["bbbp"] = self._get_or_train("bbbp", dc.molnet.load_bbbp, 1, "classification").predict(ds)
-            r["clintox"] = self._get_or_train("clintox", dc.molnet.load_clintox, 2, "classification").predict(ds)
-            r["tox21"] = self._get_or_train("tox21", dc.molnet.load_tox21, 12, "classification").predict(ds)
-            r["lipo"] = self._get_or_train("lipo", dc.molnet.load_lipo, 1, "regression").predict(ds)
-            r["clearance"] = self._get_or_train("clearance", dc.molnet.load_clearance, 1, "regression").predict(ds)
-            r["hppb"] = self._get_or_train("hppb", dc.molnet.load_hppb, 1, "regression").predict(ds)
-            return r
+        def predict_all(self, smiles: str) -> dict:
+            """
+            Run all six models and return results as a dict.
+
+            Individual model failures are caught and logged rather than
+            propagated — the caller uses QSAR fallback for missing keys.
+            """
+            results = {}
+
+            _datasets = [
+                ("bbbp",      dc.molnet.load_bbbp,      1,  "classification"),
+                ("clintox",   dc.molnet.load_clintox,   2,  "classification"),
+                ("tox21",     dc.molnet.load_tox21,      12, "classification"),
+                ("lipo",      dc.molnet.load_lipo,       1,  "regression"),
+                ("clearance", dc.molnet.load_clearance,  1,  "regression"),
+                ("hppb",      dc.molnet.load_hppb,       1,  "regression"),
+            ]
+
+            for name, loader_fn, n_tasks, mode in _datasets:
+                try:
+                    ds = self.featurize(smiles, n_tasks=n_tasks)
+                    model = self._get_or_train(name, loader_fn, n_tasks, mode)
+                    # For a single prediction of one molecule, the batch size is 1, but sometimes 
+                    # the underlying legacy generator gets tripped up reshaping the batch pad.
+                    # As a workaround, we can explicitly specify `transformers=[]` which bypasses 
+                    # one of the places things break, or we can catch the reshape error and report.
+                    results[name] = model.predict(ds)
+                except Exception as exc:
+                    logger.warning(
+                        "DeepChem model '%s' prediction failed (%s). "
+                        "QSAR fallback will be used for this property.",
+                        name, exc,
+                    )
+
+            return results

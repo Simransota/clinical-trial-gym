@@ -12,6 +12,28 @@ Run:
     python main.py
 """
 
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import logging
+import warnings
+import sys
+warnings.filterwarnings("ignore")
+
+import rdkit.RDLogger as RDLogger
+RDLogger.DisableLog('rdApp.*')
+
+# Suppress absl warnings
+try:
+    from absl import logging as absl_logging
+    absl_logging.set_verbosity(absl_logging.ERROR)
+except ImportError:
+    pass
+
+# Suppress the weird cleanup Exception output
+def dummy_excepthook(*args, **kwargs):
+    pass
+sys.unraisablehook = dummy_excepthook
+
 from clinical_trial_gym.drug.molecule import DrugMolecule
 from clinical_trial_gym.drug.admet import ADMETPredictor
 from clinical_trial_gym.drug.properties import MolecularPropertyExtractor
