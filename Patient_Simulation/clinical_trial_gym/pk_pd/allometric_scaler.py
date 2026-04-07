@@ -101,7 +101,7 @@ ALLOMETRIC_EXPONENTS: Dict[str, float] = {
     "CL":   0.75,   # Clearance
     "Vc":   1.00,   # Central volume
     "Vp":   1.00,   # Peripheral volume
-    "Q":    0.75,   # Inter-compartment flow
+    "Q":    1.00,   # Inter-compartment flow (scales with Vc/Vp which are linear)
     "ka":  -0.25,   # Absorption rate constant
     "F":    0.00,   # Bioavailability (species-invariant)
     "PPB":  0.00,   # Plasma protein binding (species-invariant)

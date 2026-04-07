@@ -319,7 +319,7 @@ class SurrogateODE:
             if dose_before and dose_before[0] is not None:
                 event = dose_before[0]
                 if event.route == "oral":
-                    current_y[0] += event.F_adjusted(self.pk["F"]) * event.dose_mgkg
+                    current_y[0] += self.pk["F"] * event.dose_mgkg
                 elif event.route == "iv_bolus":
                     current_y[1] += event.dose_mgkg / self.pk["Vc"]
 
@@ -442,9 +442,3 @@ class SurrogateODE:
             "peak_toxicity": max(s.toxicity_score for s in states),
         }
 
-
-# Patch DoseEvent for F-adjustment
-def _dose_F_adjusted(self, F: float) -> float:
-    return F if self.route == "oral" else 1.0
-
-DoseEvent.F_adjusted = _dose_F_adjusted

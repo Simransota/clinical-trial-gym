@@ -241,8 +241,11 @@ class RlAgentEnvironment(Environment):
         max_steps_hit = self._state.step_count >= FDA_RULES["max_steps"]
         agent_stopped = not action.escalate
 
+        # Track the highest dose that did not trigger FDA stopping: this is the
+        # running estimate of RP2D (highest tolerated dose seen so far).
         if not fda_stop:
-            self.rp2d_dose = self.current_dose
+            if self.rp2d_dose is None or self.current_dose > self.rp2d_dose:
+                self.rp2d_dose = self.current_dose
 
         self._done = fda_stop or agent_stopped or max_steps_hit
 
@@ -518,7 +521,7 @@ class RlAgentEnvironment(Environment):
         # Progress (35%) — prev_dose passed explicitly, no history indexing
         if dlt_rate == 0 and avg_hep < 0.5 and avg_ren > 0.7:
             if self.current_dose > prev_dose:
-                progress = min(1.0, self.current_dose / 20.0)
+                progress = min(1.0, self.current_dose / FDA_RULES["max_dose_mg_kg"])
             else:
                 progress = 0.3
         elif dlt_rate > 0 and self.current_dose <= prev_dose:

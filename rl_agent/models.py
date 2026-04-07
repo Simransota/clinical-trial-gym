@@ -51,7 +51,7 @@ class RlAgentObservation(Observation):
         description="Number of patients with serious side effects (Grade 3+)"
     )
     dlt_grade: List[int] = Field(
-        default=[],
+        default_factory=list,
         description="Side effect severity grade per patient (0=none, 4=life-threatening)"
     )
     hepatocyte_signal: float = Field(

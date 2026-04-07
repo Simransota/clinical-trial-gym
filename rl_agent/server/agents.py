@@ -197,35 +197,20 @@ class PatientAgent:
         for _ in range(steps):
             prev_blood = self.blood_conc
 
-            # Absorption from gut depot
-            absorbed = self.ka * self.depot * dt
-            self.depot = max(0.0, self.depot - absorbed)
-
-            delta_blood = (
-                  absorbed / max(self.Vc, 1e-6)
+            # Compute all derivatives at current state before any updates (Euler)
+            dDepot  = -self.ka * self.depot
+            dBlood  = (
+                  self.ka * self.depot / max(self.Vc, 1e-6)
                 - self.ke  * self.blood_conc
                 - self.k12 * self.blood_conc
                 + self.k21 * self.tissue_conc
-            ) * dt   # note: absorbed already incorporates dt above, so:
-            # corrected formulation:
-            delta_blood = (
-                  (self.ka * self.depot / max(self.Vc, 1e-6))   # re-derive without dt consumed
-                - self.ke  * self.blood_conc
-                - self.k12 * self.blood_conc
-                + self.k21 * self.tissue_conc
-            ) * dt
-            # restore depot (we'll update it cleanly below)
-            self.depot += absorbed   # undo the absorbed subtraction above
-            depot_delta = -self.ka * self.depot * dt
-            self.depot  = max(0.0, self.depot + depot_delta)
+            )
+            dTissue = self.k12 * self.blood_conc - self.k21 * self.tissue_conc
 
-            delta_tissue = (
-                self.k12 * self.blood_conc
-                - self.k21 * self.tissue_conc
-            ) * dt
-
-            self.blood_conc  = max(0.0, self.blood_conc  + delta_blood)
-            self.tissue_conc = max(0.0, self.tissue_conc + delta_tissue)
+            # Apply all updates together (standard forward Euler)
+            self.depot       = max(0.0, self.depot       + dDepot  * dt)
+            self.blood_conc  = max(0.0, self.blood_conc  + dBlood  * dt)
+            self.tissue_conc = max(0.0, self.tissue_conc + dTissue * dt)
 
             # Trapezoidal AUC stress
             avg_conc = (prev_blood + self.blood_conc) * 0.5
