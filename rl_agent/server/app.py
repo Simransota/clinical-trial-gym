@@ -41,7 +41,7 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 try:
-    from models import RlAgentAction, RlAgentObservation
+    from ..models import RlAgentAction, RlAgentObservation
     from .rl_agent_environment import RlAgentEnvironment
 except ModuleNotFoundError:
     from models import RlAgentAction, RlAgentObservation
@@ -94,16 +94,10 @@ def configure_drug(req: DrugRequest):
     Returns:
         status, drug name, HED, starting dose, and ADMET summary.
     """
-    import sys, os
-    _repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    if _repo not in sys.path:
-        sys.path.insert(0, _repo)
-
     try:
-        from drug_profile_builder import DrugProfileBuilder
+        from ..drug_profile_builder import DrugProfileBuilder
     except ImportError:
-        sys.path.insert(0, os.path.join(_repo, "rl_agent"))
-        from drug_profile_builder import DrugProfileBuilder
+        from rl_agent.drug_profile_builder import DrugProfileBuilder
 
     try:
         builder = DrugProfileBuilder(

@@ -1,0 +1,53 @@
+services:
+  rxgym-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rxgym:latest
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONPATH: /app
+      MPLCONFIGDIR: /app/.cache/matplotlib
+      PORT: 8000
+    volumes:
+      - ./analysis/reports:/app/analysis/reports
+    command: ["api"]
+
+  rxgym-inference:
+    image: rxgym:latest
+    profiles: ["inference"]
+    depends_on:
+      - rxgym-api
+    environment:
+      PYTHONPATH: /app
+      MPLCONFIGDIR: /app/.cache/matplotlib
+      ENV_URL: http://rxgym-api:8000
+      API_BASE_URL: ${API_BASE_URL:-https://router.huggingface.co/v1}
+      MODEL_NAME: ${MODEL_NAME:-Qwen/Qwen2.5-72B-Instruct}
+      HF_TOKEN: ${HF_TOKEN:-}
+      TASK_NAME: ${TASK_NAME:-phase_i_dosing}
+      ENV_NAME: ${ENV_NAME:-gym_env}
+      MAX_STEPS: ${MAX_STEPS:-8}
+      USE_LLM_POLICY: ${USE_LLM_POLICY:-false}
+      MEDICINE_NAME: ${MEDICINE_NAME:-user_compound}
+      MEDICINE_SMILES: ${MEDICINE_SMILES:-}
+      SOURCE_SPECIES: ${SOURCE_SPECIES:-rat}
+      ANIMAL_DOSE_MGKG: ${ANIMAL_DOSE_MGKG:-8.0}
+      DEBUG_DRUG: ${DEBUG_DRUG:-0}
+    command: ["inference"]
+
+  rxgym-report:
+    image: rxgym:latest
+    profiles: ["report"]
+    environment:
+      PYTHONPATH: /app
+      MPLCONFIGDIR: /app/.cache/matplotlib
+      REPORT_DRUG_NAME: ${REPORT_DRUG_NAME:-}
+      REPORT_DRUG_SMILES: ${REPORT_DRUG_SMILES:-}
+      REPORT_ANIMAL_DOSE_MGKG: ${REPORT_ANIMAL_DOSE_MGKG:-}
+      REPORT_SOURCE_SPECIES: ${REPORT_SOURCE_SPECIES:-rat}
+      REPORT_OUTDIR: ${REPORT_OUTDIR:-}
+    volumes:
+      - ./analysis/reports:/app/analysis/reports
+    command: ["report"]

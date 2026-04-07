@@ -166,12 +166,51 @@ The script emits the required stdout format:
 
 ## Docker
 
-Build and run locally:
+The root image packages the whole project:
+- OpenEnv/FastAPI server
+- baseline `inference.py`
+- researcher report generation under `analysis/`
+
+Build the image:
 
 ```bash
 docker build -t rxgym .
+```
+
+Run the API server:
+
+```bash
 docker run --rm -p 8000:8000 rxgym
 ```
+
+Run the API server with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Run baseline inference against the containerized API:
+
+```bash
+export HF_TOKEN="..."
+export MEDICINE_NAME="Acetaminophen"
+export MEDICINE_SMILES="CC(=O)NC1=CC=C(O)C=C1"
+export SOURCE_SPECIES="rat"
+export ANIMAL_DOSE_MGKG="10.0"
+export TASK_NAME="phase_i_dosing"
+docker compose --profile inference run --rm rxgym-inference
+```
+
+Generate a drug report inside the same image:
+
+```bash
+export REPORT_DRUG_NAME="Diazepam"
+export REPORT_DRUG_SMILES="CN1C(=O)CN=C(c2ccccc2)c2cc(Cl)ccc21"
+export REPORT_ANIMAL_DOSE_MGKG="2.0"
+docker compose --profile report run --rm rxgym-report
+```
+
+The report artifacts will be written to `analysis/reports/<drug>/` on your host machine.
 
 ## Hugging Face Spaces
 

@@ -7,4 +7,3 @@
 **/.ruff_cache
 gym_env
 rl_agent/.venv
-analysis
