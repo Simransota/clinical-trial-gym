@@ -142,7 +142,6 @@ Thumbs.db
 # Project specific
 Patient_Simulation/data/molnet/*_featurized*/
 Patient_Simulation/models/
-Patient_Simulation/clinical_trial_gym/claude.md
 
 # DeepChem raw downloaded datasets
 Patient_Simulation/data/molnet/*.csv
