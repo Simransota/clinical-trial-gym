@@ -158,6 +158,7 @@ class MolecularPropertyExtractor:
         "CYP2C9":             (0.3,   0.46),
         "CYP2C19":            (0.35,  0.48),
         "CYP1A2":             (0.2,   0.4),
+        "esol_solubility":    (-3.0,  2.0),
         "qed_score":          (0.55,  0.18),
         "ka":                 (1.2,   0.9),
         "CL":                 (0.5,   0.3),

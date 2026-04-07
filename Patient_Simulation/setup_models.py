@@ -75,6 +75,18 @@ DATASETS = {
         "url": "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/hppb.csv",
         "filename": "hppb.csv",
     },
+    "delaney": {
+        "url": "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/delaney-processed.csv",
+        "filename": "delaney-processed.csv",
+    },
+    "toxcast": {
+        "url": "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/toxcast_data.csv.gz",
+        "filename": "toxcast_data.csv.gz",
+    },
+    "muv": {
+        "url": "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/muv.csv.gz",
+        "filename": "muv.csv.gz",
+    },
 }
 
 MODEL_CONFIGS = [
@@ -85,6 +97,9 @@ MODEL_CONFIGS = [
     ("lipo",      "load_lipo",      1,  "regression"),
     ("clearance", "load_clearance", 1,  "regression"),
     ("hppb",      "load_hppb",      1,  "regression"),
+    ("delaney",   "load_delaney",   1,  "regression"),
+    ("toxcast",   "load_toxcast",   617,"classification"),
+    ("muv",       "load_muv",       17, "classification"),
 ]
 
 
@@ -155,99 +170,52 @@ def _apply_deepchem_numpy2_compat_patch() -> bool:
 # ── Patch 2: remove_missing_entries AxisError fix ─────────────────────────────
 
 def _patch_remove_missing_entries() -> bool:
-    """
-    Patch deepchem.utils.remove_missing_entries to handle 1-D X arrays.
-
-    Root cause
-    ----------
-    DeepChem's hppb_datasets.py (and a few others) call:
-
-        available_rows = X.any(axis=1)
-
-    When ConvMolFeaturizer returns a 1-D object array (every molecule in a
-    shard failed, or the dataset has exactly one sample), `axis=1` does not
-    exist and NumPy 2 raises:
-
-        numpy.exceptions.AxisError: axis 1 is out of bounds for array of dimension 1
-
-    The patched version:
-      - If X is 1-D → treat the single value as one "available" row (keep it).
-      - If X is 2-D → use the original axis=1 check (unchanged behaviour).
-      - If X is 0-D or empty → skip the shard gracefully.
-
-    This patch is installed on `deepchem.utils` AND on the module-level name
-    in `deepchem.molnet.load_function.hppb_datasets` so it takes effect
-    regardless of which import path was already cached.
-    """
     import numpy as np
     
-    # Track if we successfully patched anything
-    patched_any = False
-
-    def _safe_remove_missing_entries(dataset):
-        """NumPy-2-safe version of remove_missing_entries."""
-        for i, (X, y, w, ids) in enumerate(dataset.itershards()):
-            X = np.asarray(X)
-
-            if X.ndim == 0 or X.size == 0:
-                # Empty shard — nothing to filter, leave it alone.
-                logger.debug("Shard %d is empty, skipping missing-entry filter.", i)
-                continue
-
-            if X.ndim == 1:
-                # Single sample or object array of failed featurizations.
-                # Treat the whole row as available (non-zero object reference).
-                available_rows = np.array([bool(X.any())], dtype=bool)
-                if not available_rows[0]:
-                    # The one sample is all-zero → remove it.
-                    X   = X[np.array([], dtype=int)]
-                    y   = y[np.array([], dtype=int)]
-                    w   = w[np.array([], dtype=int)]
-                    ids = ids[np.array([], dtype=int)]
-                    dataset.set_shard(i, X, y, w, ids)
-                # Otherwise leave as-is (nothing to remove).
-                continue
-
-            # Normal 2-D path — identical to the original implementation.
-            available_rows = X.any(axis=1)
-            missing = int(np.count_nonzero(~available_rows))
-            if missing:
-                logger.info("Shard %d has %d missing entries.", i, missing)
-            X   = X[available_rows]
-            y   = y[available_rows]
-            w   = w[available_rows]
-            ids = ids[available_rows]
-            dataset.set_shard(i, X, y, w, ids)
-
-    _safe_remove_missing_entries._ctg_rme_patch = True
-
-    # In DeepChem 2.5.0+, remove_missing_entries is defined inside dataset modules
-    # rather than deepchem.utils. We must patch them individually.
-    modules_to_patch = [
-        "deepchem.utils",
-        "deepchem.molnet.load_function.hppb_datasets",
-        "deepchem.molnet.load_function.uv_datasets",
-        "deepchem.molnet.load_function.kaggle_datasets",
-        "deepchem.molnet.load_function.factors_datasets",
-        "deepchem.molnet.load_function.kinase_datasets",
+    patched = False
+    
+    loaders = [
+        'deepchem.molnet.load_function.hppb_datasets',
+        'deepchem.molnet.load_function.uv_datasets',
+        'deepchem.molnet.load_function.kaggle_datasets',
+        'deepchem.molnet.load_function.factors_datasets',
+        'deepchem.molnet.load_function.kinase_datasets',
+        'deepchem.molnet.load_function.delaney_datasets',
+        'deepchem.molnet.load_function.toxcast_datasets',
+        'deepchem.molnet.load_function.muv_datasets',
     ]
 
-    import importlib
-    for mod_name in modules_to_patch:
+    for m_name in loaders:
         try:
-            mod = importlib.import_module(mod_name)
-            if hasattr(mod, "remove_missing_entries"):
-                # Check if it's already our patched version
-                if getattr(mod.remove_missing_entries, "_ctg_rme_patch", False):
-                    patched_any = True
-                    continue
-                # Overwrite with our safe version
-                mod.remove_missing_entries = _safe_remove_missing_entries
-                patched_any = True
-        except ImportError:
+            mod = __import__(m_name, fromlist=['*'])
+            if not hasattr(mod, 'remove_missing_entries'):
+                continue
+                
+            if getattr(mod.remove_missing_entries, "_ctg_rme_patch", False):
+                continue
+
+            _original_rme = mod.remove_missing_entries
+
+            def _safe_remove_missing_entries(dataset):
+                for i, (X, y, w, ids) in enumerate(dataset.itershards()):
+                    X = np.asarray(X)
+                    if X.ndim == 0 or X.size == 0:
+                        continue
+                    if X.ndim == 1:
+                        available_rows = np.array([bool(X.any())], dtype=bool)
+                        if not available_rows[0]:
+                            dataset.set_shard(i, X[[]], y[[]], w[[]], ids[[]])
+                        continue
+                    available_rows = X.any(axis=1)
+                    dataset.set_shard(i, X[available_rows], y[available_rows], w[available_rows], ids[available_rows])
+
+            _safe_remove_missing_entries._ctg_rme_patch = True
+            mod.remove_missing_entries = _safe_remove_missing_entries
+            patched = True
+        except Exception:
             pass
 
-    return patched_any
+    return patched
 
 
 # ── Step 1: Download datasets ────────────────────────────────────────────────

@@ -220,6 +220,9 @@ def _patch_remove_missing_entries() -> bool:
         "deepchem.molnet.load_function.kaggle_datasets",
         "deepchem.molnet.load_function.factors_datasets",
         "deepchem.molnet.load_function.kinase_datasets",
+        "deepchem.molnet.load_function.delaney_datasets",
+        "deepchem.molnet.load_function.toxcast_datasets",
+        "deepchem.molnet.load_function.muv_datasets",
     ]
 
     import importlib
@@ -272,6 +275,9 @@ class ADMETProperties:
     clintox_approved_prob: float = np.nan
     clintox_toxic_prob: float = np.nan
     tox21_predictions: Dict[str, float] = field(default_factory=dict)
+    toxcast_predictions: Dict[str, float] = field(default_factory=dict)
+    muv_predictions: Dict[str, float] = field(default_factory=dict)
+    esol_solubility: float = np.nan
     predicted_logD: float = np.nan
     renal_clearance: float = np.nan
     source: str = "qsar_trained"
@@ -283,11 +289,23 @@ class ADMETProperties:
     def to_pkpd_params(self) -> dict:
         """Convert ADMET predictions into PK/PD parameters for surrogate ODE."""
         logD = self.predicted_logD if not np.isnan(self.predicted_logD) else 2.0
-        ka = float(np.clip(2.0 * np.exp(-0.3 * (logD - 2.0) ** 2), 0.1, 5.0))
+        logS = self.esol_solubility if not np.isnan(self.esol_solubility) else -3.0
+        
+        # Calculate absorption rate (ka) utilizing solubility from Delaney (ESOL) and logD
+        # High solubility (logS > -3) and moderate LogD (~2.0) drives higher absorption
+        # Base scale: 2.0
+        ka_solubility_factor = np.clip(1.0 + (logS + 3.0) * 0.2, 0.2, 1.5)
+        ka = float(np.clip(2.0 * ka_solubility_factor * np.exp(-0.3 * (logD - 2.0) ** 2), 0.1, 5.0))
 
+        # Bioavailability calculation driven by penetration and solubility
         bbb_p = self.BBB_probability if not np.isnan(self.BBB_probability) else 0.5
         logD_factor = float(np.exp(-0.15 * (logD - 2.0) ** 2))
-        F = float(np.clip(0.4 + 0.5 * bbb_p * logD_factor, 0.05, 0.99))
+        base_F = 0.4 + 0.5 * bbb_p * logD_factor
+        
+        # Solubility throttles maximum bioavailability
+        max_F_from_solubility = np.clip(0.99 + (logS + 2.0) * 0.1, 0.1, 0.99)
+        F = float(np.clip(min(base_F, max_F_from_solubility), 0.05, 0.99))
+        
         if not np.isnan(self.F_oral):
             F = self.F_oral
 
