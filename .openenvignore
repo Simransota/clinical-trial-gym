@@ -1,0 +1,13 @@
+.git/
+.DS_Store
+.env
+.venv/
+gym_env/
+rl_agent/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+.cache/
+analysis/reports/
+outputs/

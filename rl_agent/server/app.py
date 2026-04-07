@@ -30,6 +30,7 @@ Usage:
 
 from dotenv import load_dotenv
 load_dotenv()
+import os
 from fastapi import HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -53,6 +54,34 @@ except ModuleNotFoundError:
 _CURRENT_DRUG_PROFILE = None
 
 
+def _build_drug_profile(smiles: str, name: str, source_species: str, animal_dose_mgkg: float) -> dict:
+    try:
+        from ..drug_profile_builder import DrugProfileBuilder
+    except ImportError:
+        from rl_agent.drug_profile_builder import DrugProfileBuilder
+
+    builder = DrugProfileBuilder(
+        smiles=smiles,
+        name=name,
+        source_species=source_species,
+        animal_dose_mgkg=animal_dose_mgkg,
+    )
+    return builder.build()
+
+
+def _load_default_drug_profile() -> Optional[dict]:
+    default_smiles = os.getenv("DEFAULT_DRUG_SMILES", "").strip()
+    if not default_smiles:
+        return None
+
+    return _build_drug_profile(
+        smiles=default_smiles,
+        name=os.getenv("DEFAULT_DRUG_NAME", "investigational compound"),
+        source_species=os.getenv("DEFAULT_SOURCE_SPECIES", "rat"),
+        animal_dose_mgkg=float(os.getenv("DEFAULT_ANIMAL_DOSE_MGKG", "8.0")),
+    )
+
+
 def _env_factory():
     return RlAgentEnvironment(drug_profile=_CURRENT_DRUG_PROFILE)
 
@@ -65,6 +94,12 @@ app = create_app(
     env_name="rl_agent",
     max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
 )
+
+if _CURRENT_DRUG_PROFILE is None:
+    try:
+        _CURRENT_DRUG_PROFILE = _load_default_drug_profile()
+    except Exception:
+        _CURRENT_DRUG_PROFILE = None
 
 # app.py — add this after create_app(...)
 
@@ -95,18 +130,12 @@ def configure_drug(req: DrugRequest):
         status, drug name, HED, starting dose, and ADMET summary.
     """
     try:
-        from ..drug_profile_builder import DrugProfileBuilder
-    except ImportError:
-        from rl_agent.drug_profile_builder import DrugProfileBuilder
-
-    try:
-        builder = DrugProfileBuilder(
+        profile = _build_drug_profile(
             smiles=req.smiles,
-            name=req.name,
-            source_species=req.source_species,
-            animal_dose_mgkg=req.animal_dose_mgkg,
+            name=req.name or "investigational compound",
+            source_species=req.source_species or "rat",
+            animal_dose_mgkg=req.animal_dose_mgkg or 8.0,
         )
-        profile = builder.build()
     except Exception as exc:
         raise HTTPException(
             status_code=422,

@@ -122,6 +122,7 @@ class RlAgentEnvironment(Environment):
         self._start_dose = 0.0
         self._drug_configured = False
         self._drug_profile_hed = None
+        self._configured_smiles = None
         self._task_targets = {
             "phase_i_dosing": None,
             "allometric_scaling": None,
@@ -131,6 +132,34 @@ class RlAgentEnvironment(Environment):
             self.configure_drug(drug_profile)
 
         self.current_dose = self._start_dose
+
+    def _configure_from_action(self, action: RlAgentAction) -> None:
+        drug_smiles = getattr(action, "drug_smiles", None)
+        if not drug_smiles:
+            return
+
+        should_reconfigure = (
+            not self._drug_configured
+            or (
+                self._state.step_count == 0
+                and drug_smiles != self._configured_smiles
+            )
+        )
+        if not should_reconfigure:
+            return
+
+        try:
+            from ..drug_profile_builder import DrugProfileBuilder
+        except ImportError:
+            from rl_agent.drug_profile_builder import DrugProfileBuilder
+
+        builder = DrugProfileBuilder(
+            smiles=drug_smiles,
+            name=getattr(action, "drug_name", None) or "investigational compound",
+            source_species=getattr(action, "source_species", None) or "rat",
+            animal_dose_mgkg=float(getattr(action, "animal_dose_mgkg", None) or 8.0),
+        )
+        self.configure_drug(builder.build())
 
     # ── reset() ─────────────────────────────────────────────────────────────
     def reset(self) -> RlAgentObservation:
@@ -171,6 +200,7 @@ class RlAgentEnvironment(Environment):
 
     # ── step() ──────────────────────────────────────────────────────────────
     def step(self, action: RlAgentAction) -> RlAgentObservation:
+        self._configure_from_action(action)
         if not self._drug_configured:
             raise RuntimeError(
                 "No drug configured. Submit a molecule via /drug before calling /step."
@@ -474,6 +504,7 @@ class RlAgentEnvironment(Environment):
             raise ValueError("human_equivalent_dose must be > 0")
 
         self.drug_name    = str(drug_profile["name"])
+        self._configured_smiles = str(drug_profile.get("smiles") or "")
         self.drug_params  = dict(params)
         self.safety_flags = dict(drug_profile["safety_flags"])
         self._drug_profile_hed = hed

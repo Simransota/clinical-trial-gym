@@ -74,8 +74,30 @@ ANIMAL_DOSE_MGKG = float(os.getenv("ANIMAL_DOSE_MGKG", "8.0"))
 
 # Max possible reward: based on trial success
 MAX_TOTAL_REWARD = 1.0  # Assuming score is normalized
-USE_LLM_POLICY = os.getenv("USE_LLM_POLICY", "false").lower() in ("1", "true", "yes")
+USE_LLM_POLICY = os.getenv("USE_LLM_POLICY", "true").lower() in ("1", "true", "yes")
 DEBUG_DRUG = os.getenv("DEBUG_DRUG", "0").lower() in ("1", "true", "yes")
+DEFAULT_ENV_URL = os.getenv("DEFAULT_ENV_URL", "https://simransota-clinical-trial-env.hf.space")
+
+DEFAULT_DRUGS = {
+    "phase_i_dosing": {
+        "name": "Acetaminophen",
+        "smiles": "CC(=O)NC1=CC=C(O)C=C1",
+        "source_species": "rat",
+        "animal_dose_mgkg": 10.0,
+    },
+    "allometric_scaling": {
+        "name": "Naproxen",
+        "smiles": "CC(C1=CC=CC=C1)C(O)=O",
+        "source_species": "rat",
+        "animal_dose_mgkg": 8.0,
+    },
+    "combo_ddi": {
+        "name": "Diazepam",
+        "smiles": "CN1C(=O)CN=C(c2ccccc2)c2cc(Cl)ccc21",
+        "source_species": "rat",
+        "animal_dose_mgkg": 2.0,
+    },
+}
 
 # Centralized policy configuration (task-aware escalation/hold logic).
 POLICY_CONFIG = {
@@ -146,7 +168,7 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
 
 
 def debug_log(message: str) -> None:
@@ -197,7 +219,7 @@ def build_user_prompt(
 
 
 def get_model_message(
-    client: OpenAI,
+    client: Optional[OpenAI],
     obs: dict,
     step: int,
     task_name: str,
@@ -207,6 +229,8 @@ def get_model_message(
     cumulative_dlt_rate: float,
     organ_risk_trend: float,
 ) -> str:
+    if client is None:
+        raise RuntimeError("OpenAI client is unavailable because no API key was provided.")
     user_prompt = build_user_prompt(
         obs=obs,
         step=step,
@@ -236,13 +260,13 @@ def get_model_message(
 
 
 def env_reset() -> dict:
-    ENV_URL = os.getenv("ENV_URL", "http://localhost:8000")
+    ENV_URL = os.getenv("ENV_URL", DEFAULT_ENV_URL)
     resp = requests.post(f"{ENV_URL}/reset", timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 def env_configure_drug(smiles: str, name: str, source_species: str, animal_dose_mgkg: float) -> dict:
-    ENV_URL = os.getenv("ENV_URL", "http://localhost:8000")
+    ENV_URL = os.getenv("ENV_URL", DEFAULT_ENV_URL)
     payload = {
         "smiles": smiles,
         "name": name,
@@ -263,10 +287,25 @@ def env_configure_drug(smiles: str, name: str, source_species: str, animal_dose_
 
 
 def env_step(action: dict) -> dict:
-    ENV_URL = os.getenv("ENV_URL", "http://localhost:8000")
+    ENV_URL = os.getenv("ENV_URL", DEFAULT_ENV_URL)
     resp = requests.post(f"{ENV_URL}/step", json={"action": action}, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+def env_close() -> None:
+    """Stateless HTTP mode does not require explicit shutdown, but keep the hook for benchmark parity."""
+    return None
+
+
+def resolve_submission_drug(task_name: str) -> dict:
+    task_default = DEFAULT_DRUGS.get(task_name, DEFAULT_DRUGS["phase_i_dosing"])
+    return {
+        "name": os.getenv("MEDICINE_NAME") or task_default["name"],
+        "smiles": os.getenv("MEDICINE_SMILES") or task_default["smiles"],
+        "source_species": os.getenv("SOURCE_SPECIES") or task_default["source_species"],
+        "animal_dose_mgkg": float(os.getenv("ANIMAL_DOSE_MGKG", str(task_default["animal_dose_mgkg"]))),
+    }
 
 
 def normalize_env_response(result: dict) -> tuple[dict, float, bool]:
@@ -744,7 +783,7 @@ def parse_action(response_text: str, current_dose: float) -> dict:
 
 
 def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY) if API_KEY else None
 
     rewards: List[float] = []
     actions_taken: List[dict] = []
@@ -753,7 +792,8 @@ def main() -> None:
     steps_taken = 0
     score = 0.0
     success = False
-    hed_anchor = max(0.1, ANIMAL_DOSE_MGKG * 6.0 / 37.0)
+    submission_drug = resolve_submission_drug(TASK_NAME)
+    hed_anchor = max(0.1, float(submission_drug["animal_dose_mgkg"]) * 6.0 / 37.0)
     cyp_inhibitions: List[str] = []
     task_targets = {
         "phase_i_dosing": hed_anchor * 1.5,
@@ -771,13 +811,13 @@ def main() -> None:
     log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        if not MEDICINE_SMILES:
-            raise RuntimeError("MEDICINE_SMILES is required to run end-to-end trial inference.")
+        if USE_LLM_POLICY and client is None:
+            debug_log("HF_TOKEN/API_KEY missing; falling back to deterministic controller for this run.")
         drug_cfg_raw = env_configure_drug(
-            smiles=MEDICINE_SMILES,
-            name=MEDICINE_NAME,
-            source_species=SOURCE_SPECIES,
-            animal_dose_mgkg=ANIMAL_DOSE_MGKG,
+            smiles=str(submission_drug["smiles"]),
+            name=str(submission_drug["name"]),
+            source_species=str(submission_drug["source_species"]),
+            animal_dose_mgkg=float(submission_drug["animal_dose_mgkg"]),
         )
         drug_cfg = drug_cfg_raw
         fragility_profile = derive_fragility_profile(drug_cfg)
@@ -827,7 +867,7 @@ def main() -> None:
             )
 
             # Optional LLM policy mode; deterministic policy remains benchmark default.
-            if USE_LLM_POLICY:
+            if USE_LLM_POLICY and client is not None:
                 message = get_model_message(
                     client=client,
                     obs=obs,
@@ -864,6 +904,10 @@ def main() -> None:
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     finally:
+        try:
+            env_close()
+        except Exception as exc:
+            debug_log(f"env_close failed: {exc}")
         log_end(success=success, steps=steps_taken,
                 score=score, rewards=rewards)
 
