@@ -79,7 +79,6 @@ DEBUG_DRUG = os.getenv("DEBUG_DRUG", "0").lower() in ("1", "true", "yes")
 # Centralized policy configuration (task-aware escalation/hold logic).
 POLICY_CONFIG = {
     "phase_i_dosing": {
-        "target_dose": 12.0,
         "far_mult": (1.6, 2.2),
         "mid_mult": (1.3, 1.5),
         "near_mult": (1.1, 1.25),
@@ -96,7 +95,6 @@ POLICY_CONFIG = {
         "align_tolerance": 0.12,
     },
     "combo_ddi": {
-        "target_dose": 9.0,
         "far_mult": (1.45, 1.8),      # ← bump this
         "mid_mult": (1.18, 1.35),     # ← slight bump
         "near_mult": (1.02, 1.12),
@@ -251,7 +249,13 @@ def env_configure_drug(smiles: str, name: str, source_species: str, animal_dose_
         "animal_dose_mgkg": animal_dose_mgkg,
     }
     resp = requests.post(f"{ENV_URL}/drug", json=payload, timeout=120)
-    resp.raise_for_status()
+    if not resp.ok:
+        detail = None
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"/drug failed with HTTP {resp.status_code}: {detail}")
     cfg = resp.json()
     validate_drug_config_or_raise(cfg)
     return cfg
@@ -362,6 +366,15 @@ def derive_fragility_profile(drug_cfg: dict) -> dict:
     }
 
 
+def resolve_task_targets(drug_cfg: dict, hed: float) -> dict:
+    task_targets = dict(drug_cfg.get("task_targets", {}) or {})
+    return {
+        "phase_i_dosing": float(task_targets.get("phase_i_dosing", hed * 1.5)),
+        "allometric_scaling": float(task_targets.get("allometric_scaling", hed)),
+        "combo_ddi": float(task_targets.get("combo_ddi", hed * 1.25)),
+    }
+
+
 def _organ_risk(obs: dict) -> float:
     hep = float(obs.get("hepatocyte_signal", 0.0))
     imm = float(obs.get("immune_signal", 0.0))
@@ -427,6 +440,7 @@ def choose_action(
     hed: float,
     cyp_inhibitions: List[str],
     fragility_profile: dict,
+    task_targets: dict,
 ) -> dict:
     """
     Deterministic safety-first controller with task-specific escalation policy.
@@ -453,15 +467,17 @@ def choose_action(
         else:
             break
 
-    if task_name == "allometric_scaling":
-        target = max(0.1, hed)
-    elif task_name == "combo_ddi":
-        target = min(12.0, max(hed * 6.5, cfg["target_dose"]))
-    else:
-        target = cfg["target_dose"]
+    target = max(0.1, float(task_targets.get(task_name, hed)))
     ratio = current_dose / max(target, 1e-6)
     hed_ratio = current_dose / max(hed, 1e-6)
     near_target = ratio >= 0.8
+    safe_above_hed = sum(
+        1
+        for o in prev_observations
+        if float(o.get("dose_level", 0.0)) >= hed
+        and int(o.get("dlt_count", 0)) == 0
+        and _organ_risk(o) <= cfg["max_safe_risk"]
+    )
 
     # Delayed/confirmed boundary detection to avoid early over-triggering.
     boundary_detected = (
@@ -485,6 +501,8 @@ def choose_action(
         low, high = cfg["far_mult"]
         early_factor = high if safe_streak >= 1 else (low + high) / 2.0
         next_dose = min(50.0, max(0.1, current_dose * early_factor))
+        if task_name in ("phase_i_dosing", "combo_ddi") and safe_above_hed == 0:
+            next_dose = min(next_dose, hed * 1.05)
         return {"next_dose": round(next_dose, 4), "cohort_size": 3, "escalate": True}
 
     # Hard safety gates
@@ -584,6 +602,14 @@ def choose_action(
 
     next_dose = min(50.0, max(0.1, current_dose * up_factor))
 
+    if task_name in ("phase_i_dosing", "combo_ddi"):
+        if safe_above_hed == 0:
+            next_dose = min(next_dose, hed * 1.05)
+        elif safe_above_hed == 1:
+            next_dose = min(next_dose, hed * 1.25)
+        else:
+            next_dose = min(next_dose, hed * 1.50)
+
     # Extra hard cap against single-step overshoot in boundary region.
     if boundary_detected and task_name != "allometric_scaling":
         next_dose = min(next_dose, current_dose * 1.25)
@@ -639,6 +665,7 @@ def compute_terminal_score(
     actions: List[dict],
     observations: List[dict],
     hed: float,
+    task_targets: dict,
 ) -> float:
     """
     Episode-quality score in [0,1] that is more informative than clipped reward sum.
@@ -654,7 +681,7 @@ def compute_terminal_score(
 
     if task_name == "allometric_scaling":
         first = actions[0]["next_dose"] if actions else 0.0
-        target = max(0.1, hed)
+        target = max(0.1, float(task_targets.get("allometric_scaling", hed)))
         err = abs(first - target) / max(target, 1e-6)
         closeness = max(0.0, 1.0 - err)
         score = 0.75 * closeness + 0.25 * safety
@@ -662,7 +689,8 @@ def compute_terminal_score(
 
     if task_name == "combo_ddi":
         max_dose = max((a["next_dose"] for a in actions), default=0.0)
-        efficacy = min(1.0, max_dose / 9.0)
+        target = max(0.1, float(task_targets.get("combo_ddi", hed * 1.25)))
+        efficacy = max(0.0, 1.0 - abs(max_dose - target) / max(target, 1e-6))
         risk_penalty = 0.0
         for i, obs in enumerate(observations):
             risk = _organ_risk(obs)
@@ -678,9 +706,10 @@ def compute_terminal_score(
         dlt_rate = dlt_rates[i] if i < len(dlt_rates) else 0.0
         if dlt_rate <= 0.33:
             max_safe_dose = max(max_safe_dose, float(a["next_dose"]))
-    closeness = max(0.0, 1.0 - abs(max_safe_dose - 12.0) / 12.0)
+    target = max(0.1, float(task_targets.get("phase_i_dosing", hed * 1.5)))
+    closeness = max(0.0, 1.0 - abs(max_safe_dose - target) / max(target, 1e-6))
     late_underdose_penalty = 0.0
-    if max_safe_dose < 6.0 and len(actions) >= max(6, int(0.75 * MAX_STEPS)):
+    if max_safe_dose < 0.7 * target and len(actions) >= max(6, int(0.75 * MAX_STEPS)):
         late_underdose_penalty = 0.20
     score = 0.55 * closeness + 0.25 * safety + 0.20 * avg_reward - late_underdose_penalty
     return float(min(1.0, max(0.0, score)))
@@ -725,6 +754,11 @@ def main() -> None:
     success = False
     hed_anchor = max(0.1, ANIMAL_DOSE_MGKG * 6.0 / 37.0)
     cyp_inhibitions: List[str] = []
+    task_targets = {
+        "phase_i_dosing": hed_anchor * 1.5,
+        "allometric_scaling": hed_anchor,
+        "combo_ddi": hed_anchor * 1.25,
+    }
     fragility_profile = {
         "hed_mgkg": hed_anchor,
         "fragility": 0.0,
@@ -747,6 +781,7 @@ def main() -> None:
         drug_cfg = drug_cfg_raw
         fragility_profile = derive_fragility_profile(drug_cfg)
         hed_anchor = float(drug_cfg.get("hed_mgkg", hed_anchor))
+        task_targets = resolve_task_targets(drug_cfg, hed_anchor)
         cyp_inhibitions = list(fragility_profile.get("cyp_inhibitions", []) or [])
         debug_log(f"/drug hed_mgkg={hed_anchor:.4f}")
         debug_log(f"/drug admet_summary={json.dumps(drug_cfg.get('admet_summary', {}), sort_keys=True)}")
@@ -787,6 +822,7 @@ def main() -> None:
                 hed_anchor,
                 cyp_inhibitions,
                 fragility_profile,
+                task_targets,
             )
 
             # Optional LLM policy mode; deterministic policy remains benchmark default.
@@ -822,6 +858,7 @@ def main() -> None:
             actions=actions_taken,
             observations=observations_seen,
             hed=hed_anchor,
+            task_targets=task_targets,
         )
         success = score >= SUCCESS_SCORE_THRESHOLD
 

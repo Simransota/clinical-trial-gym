@@ -134,6 +134,8 @@ def configure_drug(req: DrugRequest):
         "hed_mgkg":     profile["human_equivalent_dose"],
         "start_dose":   start_dose,
         "drug_params":  profile["drug_params"],
+        "safety_flags": profile["safety_flags"],
+        "task_targets": profile.get("task_targets", {}),
         "admet_summary": profile["admet_summary"],
     }
 

@@ -143,6 +143,10 @@ class SurrogateODE:
     For IV infusion: rate-based input; not yet implemented in v1.
     """
 
+    # DEFAULT_PD_PARAMS is intentionally NOT used as a silent fallback.
+    # All PD parameters must originate from ADMETProperties.to_pd_params().
+    # This sentinel dict is exposed only for unit-test scaffolding; the
+    # PatientAgent always passes drug-derived pd_params.
     DEFAULT_PD_PARAMS = {
         "Emax": 0.9,
         "EC50": 1.0,
@@ -160,9 +164,17 @@ class SurrogateODE:
     ):
         self.bw = body_weight_kg
         self.pk = dict(pkpd_params)
-        self.pd = dict(self.DEFAULT_PD_PARAMS)
-        if pd_params:
-            self.pd.update(pd_params)
+        # PD params must come from to_pd_params() in production.
+        # In tests that pass explicit pd_params, those are used directly.
+        if pd_params is not None:
+            self.pd = dict(pd_params)
+        else:
+            # No drug profile available — use DEFAULT only in test/stub contexts.
+            self.pd = dict(self.DEFAULT_PD_PARAMS)
+
+        # DDI: CYP-mediated clearance inhibition factor.
+        # Set via set_cyp_inhibition_factor(); initially no interaction.
+        self._cl_inhibition_factor: float = 1.0   # effective CL = CL / factor
 
         # Apply BioGears calibration if available
         if biogears_calibration:
@@ -214,6 +226,37 @@ class SurrogateODE:
     # ODE definition
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # DDI / CYP inhibition interface
+    # ------------------------------------------------------------------
+
+    def set_cyp_inhibition_factor(self, factor: float):
+        """
+        Set effective CL reduction due to CYP enzyme inhibition.
+
+        This implements the static mechanistic DDI model (FDA M12 guidance):
+            CL_eff = CL_nominal / inhibition_factor
+
+        Where inhibition_factor = 1 + [I]_unbound / Ki
+        (competitive inhibition; Rowland-Matin equation).
+
+        Parameters
+        ----------
+        factor : float
+            Inhibition factor ≥ 1.0.
+            1.0 = no inhibition; 5.0 = 5-fold CL reduction (AUC 5×).
+        """
+        self._cl_inhibition_factor = float(max(factor, 1.0))
+
+    def reset_cyp_inhibition(self):
+        """Remove DDI effect (restore full clearance)."""
+        self._cl_inhibition_factor = 1.0
+
+    @property
+    def effective_cl(self) -> float:
+        """Current effective clearance after DDI adjustment (L/h/kg)."""
+        return self.pk["CL"] / self._cl_inhibition_factor
+
     def _odes(self, t: float, y: np.ndarray, dose_events: list) -> np.ndarray:
         """
         Two-compartment ODE system.
@@ -225,6 +268,10 @@ class SurrogateODE:
           AUC   — cumulative area under the curve (mg·h/L)
 
         Returns dy/dt.
+
+        DDI: effective clearance = CL / _cl_inhibition_factor.
+        This is updated externally by ComboDDIEnv at each time step using the
+        perpetrator drug's current free concentration.
         """
         Depot, Cc, Cp, AUC = y
         Cc = max(Cc, 0.0)
@@ -232,8 +279,8 @@ class SurrogateODE:
         Depot = max(Depot, 0.0)
 
         ka = self.pk["ka"]
-        F  = self.pk["F"]
-        CL = self.pk["CL"]
+        # Apply DDI-adjusted clearance (competitive inhibition model)
+        CL = self.pk["CL"] / max(self._cl_inhibition_factor, 1.0)
         Vc = self.pk["Vc"]
         Vp = self.pk["Vp"]
         Q  = self.pk["Q"]
@@ -424,6 +471,7 @@ class SurrogateODE:
         self._current_state = PKPDState()
         self._prev_t = 0.0
         self._depot = 0.0
+        self._cl_inhibition_factor = 1.0   # clear any DDI effect
 
     def get_summary_stats(self) -> dict:
         """Returns AUC, Cmax, T>MTC fraction, Tmax."""

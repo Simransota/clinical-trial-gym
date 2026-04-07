@@ -231,8 +231,8 @@ class MolecularPropertyExtractor:
 
         # Group 2: ADMET predictions (all from DeepChem models)
         admet_features = [
-            ("F_oral",        admet.F_oral if not np.isnan(admet.F_oral) else 0.65),
-            ("PPB",           admet.PPB if not np.isnan(admet.PPB) else 0.85),
+            ("F_oral",        admet.F_oral),
+            ("PPB",           admet.PPB),
             ("BBB_penetrant", float(admet.BBB_penetrant)),
             ("DILI_flag",     float(admet.DILI_flag)),
             ("hERG_flag",     float(admet.hERG_flag)),
@@ -248,26 +248,26 @@ class MolecularPropertyExtractor:
 
         # Group 3: Key PK params (derived from ADMET model outputs)
         pk_features = [
-            ("ka",  pkpd_params.get("ka",  1.0)),
-            ("F",   pkpd_params.get("F",   0.7)),
-            ("CL",  pkpd_params.get("CL",  0.5)),
-            ("Vd",  pkpd_params.get("Vc",  1.0) + pkpd_params.get("Vp", 0.5)),
+            ("ka",  pkpd_params["ka"]),
+            ("F",   pkpd_params["F"]),
+            ("CL",  pkpd_params["CL"]),
+            ("Vd",  pkpd_params["Vc"] + pkpd_params["Vp"]),
         ]
         for name, val in pk_features:
             features.append(float(val))
             names.append(f"pk_{name}")
 
         # Group 4: QED
-        features.append(float(mol.qed_score) if not np.isnan(mol.qed_score) else 0.5)
+        features.append(float(mol.qed_score))
         names.append("meta_qed")
 
         obs = np.array(features, dtype=np.float32)
+        if not np.all(np.isfinite(obs)):
+            bad = [names[i] for i, val in enumerate(obs) if not np.isfinite(val)]
+            raise ValueError(f"Observation vector contains non-finite values for {bad}")
 
         if self.normalize:
             obs = self._normalize(obs, names)
-
-        # Sanity check: replace any remaining NaN/Inf
-        obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=0.0)
 
         return obs, names
 
@@ -319,7 +319,7 @@ class MolecularPropertyExtractor:
         cyp_count = sum(admet.cyp_inhibition_profile().values())
 
         # Weight ClinTox probability into the score
-        clintox_weight = admet.clintox_toxic_prob if not np.isnan(admet.clintox_toxic_prob) else 0.0
+        clintox_weight = float(admet.clintox_toxic_prob)
 
         # Weight Tox21 active assay fraction
         tox21_active = sum(1 for v in admet.tox21_predictions.values() if v > 0.5)

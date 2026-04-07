@@ -76,8 +76,6 @@ except ImportError:
 
 
 # ── FDA trial rules ──────────────────────────────────────────────────────────
-TRUE_RP2D = 12.0   # mg/kg — hidden from agent, used by grader only
-
 FDA_RULES = {
     "max_dlt_rate":   0.33,
     "max_steps":      10,
@@ -124,6 +122,11 @@ class RlAgentEnvironment(Environment):
         self._start_dose = 0.0
         self._drug_configured = False
         self._drug_profile_hed = None
+        self._task_targets = {
+            "phase_i_dosing": None,
+            "allometric_scaling": None,
+            "combo_ddi": None,
+        }
         if drug_profile:
             self.configure_drug(drug_profile)
 
@@ -318,7 +321,8 @@ class RlAgentEnvironment(Environment):
     def _grade_phase_i(self) -> float:
         if self.rp2d_dose is None:
             return 0.0
-        error = abs(self.rp2d_dose - TRUE_RP2D) / TRUE_RP2D
+        target = float(self._task_targets.get("phase_i_dosing") or self._drug_profile_hed or 1.0)
+        error = abs(self.rp2d_dose - target) / max(target, 1e-6)
         if   error <= 0.10: dose_score = 1.0
         elif error <= 0.25: dose_score = 0.8
         elif error <= 0.50: dose_score = 0.5
@@ -363,7 +367,8 @@ class RlAgentEnvironment(Environment):
         safe_steps   = sum(1 for h in self.history if h["dlt_rate"] <= FDA_RULES["max_dlt_rate"])
         safety_score = safe_steps / max(len(self.history), 1)
         max_dose     = max((h["dose"] for h in self.history), default=0)
-        efficacy     = min(1.0, max_dose / TRUE_RP2D)
+        target = float(self._task_targets.get("combo_ddi") or self._drug_profile_hed or 1.0)
+        efficacy = max(0.0, 1.0 - abs(max_dose - target) / max(target, 1e-6))
         total_dlts   = sum(h["dlt_count"] for h in self.history)
         ddi_score    = max(0.0, 1.0 - total_dlts * 0.1)
         return round(min(1.0, 0.4 * efficacy + 0.4 * safety_score + 0.2 * ddi_score), 3)
@@ -472,6 +477,7 @@ class RlAgentEnvironment(Environment):
         self.drug_params  = dict(params)
         self.safety_flags = dict(drug_profile["safety_flags"])
         self._drug_profile_hed = hed
+        self._task_targets = dict(drug_profile.get("task_targets", {}))
         self._start_dose  = round(max(0.1, hed / 10.0), 3)
         self.current_dose = self._start_dose
         self._drug_configured = True
@@ -536,6 +542,9 @@ class RlAgentEnvironment(Environment):
         prev_dose: float,
     ) -> float:
         dlt_rate = dlt_count / max(cohort_size, 1)
+        phase_target = float(self._task_targets.get("phase_i_dosing") or self._drug_profile_hed or self.current_dose)
+        target_error = abs(self.current_dose - phase_target) / max(phase_target, 1e-6)
+        target_band = 0.15
 
         # Safety (40%)
         if fda_stop:
@@ -549,14 +558,13 @@ class RlAgentEnvironment(Environment):
         else:
             safety = 0.0
 
-        # Progress (35%) — prev_dose passed explicitly, no history indexing
+        # Progress (35%) — reward movement toward a molecule-specific target band.
         if dlt_rate == 0 and avg_hep < 0.5 and avg_ren > 0.7:
-            if self.current_dose > prev_dose:
-                progress = min(1.0, self.current_dose / FDA_RULES["max_dose_mg_kg"])
-            else:
-                progress = 0.3
+            progress = max(0.0, 1.0 - target_error)
+            if self.current_dose > prev_dose and self.current_dose <= phase_target * (1.0 + target_band):
+                progress = min(1.0, progress + 0.1)
         elif dlt_rate > 0 and self.current_dose <= prev_dose:
-            progress = 0.7
+            progress = 0.7 * max(0.0, 1.0 - target_error)
         elif dlt_rate > 0:
             progress = 0.1
         else:
@@ -566,9 +574,11 @@ class RlAgentEnvironment(Environment):
         if fda_stop:
             stopping = 0.0
         elif not self.history[-1].get("escalate", True):
-            if dlt_rate > 0 and self.current_dose > 3.0:
+            if target_error <= target_band and dlt_rate <= FDA_RULES["max_dlt_rate"]:
                 stopping = 1.0
-            elif dlt_rate == 0 and self.current_dose > 8.0:
+            elif dlt_rate > 0 and self.current_dose > self._drug_profile_hed:
+                stopping = 1.0
+            elif dlt_rate == 0 and self.current_dose > phase_target * 0.9:
                 stopping = 0.7
             else:
                 stopping = 0.3

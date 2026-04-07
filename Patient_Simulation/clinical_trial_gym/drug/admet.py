@@ -283,13 +283,20 @@ class ADMETProperties:
     source: str = "qsar_trained"
     prediction_confidence: float = np.nan
 
+    @staticmethod
+    def _require_finite(name: str, value: float) -> float:
+        value = float(value)
+        if not np.isfinite(value):
+            raise ValueError(f"ADMET property '{name}' must be finite for simulation, got {value!r}")
+        return value
+
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
 
     def to_pkpd_params(self) -> dict:
         """Convert ADMET predictions into PK/PD parameters for surrogate ODE."""
-        logD = self.predicted_logD if not np.isnan(self.predicted_logD) else 2.0
-        logS = self.esol_solubility if not np.isnan(self.esol_solubility) else -3.0
+        logD = self._require_finite("predicted_logD", self.predicted_logD)
+        logS = self._require_finite("esol_solubility", self.esol_solubility)
         
         # Calculate absorption rate (ka) utilizing solubility from Delaney (ESOL) and logD
         # High solubility (logS > -3) and moderate LogD (~2.0) drives higher absorption
@@ -298,7 +305,7 @@ class ADMETProperties:
         ka = float(np.clip(2.0 * ka_solubility_factor * np.exp(-0.3 * (logD - 2.0) ** 2), 0.1, 5.0))
 
         # Bioavailability calculation driven by penetration and solubility
-        bbb_p = self.BBB_probability if not np.isnan(self.BBB_probability) else 0.5
+        bbb_p = self._require_finite("BBB_probability", self.BBB_probability)
         logD_factor = float(np.exp(-0.15 * (logD - 2.0) ** 2))
         base_F = 0.4 + 0.5 * bbb_p * logD_factor
         
@@ -306,21 +313,17 @@ class ADMETProperties:
         max_F_from_solubility = np.clip(0.99 + (logS + 2.0) * 0.1, 0.1, 0.99)
         F = float(np.clip(min(base_F, max_F_from_solubility), 0.05, 0.99))
         
-        if not np.isnan(self.F_oral):
-            F = self.F_oral
+        F = self._require_finite("F_oral", self.F_oral)
 
-        CL_raw = self.clearance_ml_min_kg
-        if np.isnan(CL_raw) or CL_raw <= 0:
-            CL = float(np.clip(0.2 + 0.3 * max(0, logD), 0.05, 10.0))
-        else:
-            CL = float(np.clip(CL_raw * 60.0 / 1000.0, 0.01, 50.0))
+        CL_raw = self._require_finite("clearance_ml_min_kg", self.clearance_ml_min_kg)
+        CL = float(np.clip(CL_raw * 60.0 / 1000.0, 0.01, 50.0))
 
-        ppb = self.PPB if not np.isnan(self.PPB) else 0.85
-        ppb = float(np.clip(ppb, 0.01, 0.99))
+        ppb = float(np.clip(self._require_finite("PPB", self.PPB), 0.01, 0.99))
         fu = float(max(0.01, 1.0 - ppb))
 
-        Vd = self.Vd if (not np.isnan(self.Vd) and self.Vd > 0) else \
-            float(np.clip(0.5 * (10 ** (0.4 * logD)) / (fu + 0.01), 0.1, 50.0))
+        Vd = self._require_finite("Vd", self.Vd)
+        if Vd <= 0:
+            raise ValueError(f"ADMET property 'Vd' must be positive for simulation, got {Vd!r}")
 
         cf = float(np.clip(0.3 + 0.4 * fu, 0.2, 0.7))
         Vc = float(cf * Vd)
@@ -332,6 +335,16 @@ class ADMETProperties:
             "Vp": Vp, "Q": Q, "PPB": ppb, "fu": fu,
         }
 
+    @staticmethod
+    def estimate_esol_solubility(logD: float, molecular_weight: float) -> float:
+        """
+        Descriptor-based ESOL-style solubility estimate (logS).
+        This is a deterministic model output from molecular properties, not a
+        silent runtime fallback.
+        """
+        mw_term = 0.01 * float(molecular_weight)
+        return float(np.clip(0.5 - float(logD) - mw_term, -8.0, 2.0))
+
     def cyp_inhibition_profile(self) -> Dict[str, bool]:
         return {
             "CYP3A4":  self.CYP3A4_inhibition,
@@ -340,6 +353,150 @@ class ADMETProperties:
             "CYP2C19": self.CYP2C19_inhibition,
             "CYP1A2":  self.CYP1A2_inhibition,
         }
+
+    def to_pd_params(self) -> dict:
+        """
+        Derive pharmacodynamic (PD) parameters from ADMET predictions.
+
+        All outputs are computed from molecular/ADMET signals — nothing is
+        hardcoded.  This feeds directly into SurrogateODE as pd_params.
+
+        Returns
+        -------
+        dict with keys:
+            Emax  — maximum pharmacological effect [0, 1]
+            EC50  — half-maximal effective concentration (mg/L)
+            n     — Hill coefficient (steepness of E-R curve)
+            MTC   — minimum toxic concentration (mg/L)
+            MEC   — minimum effective concentration (mg/L)
+
+        Scientific basis
+        ----------------
+        EC50 (total plasma):
+            EC50_free ≈ MW-normalised potency proxy;
+            EC50_total = EC50_free / fu   (PPB correction per Rowland & Tozer)
+            Lipophilicity modulates distribution to site of action.
+
+        Therapeutic index (TI = MTC / EC50):
+            TI ~ 10 for average drugs (Rang & Dale, Pharmacology 9th ed.)
+            Reduced for DILI/hERG/ClinTox-flagged compounds.
+
+        MEC = 0.5 × EC50  (50% of the E-R curve midpoint is the minimum
+            exposure required to see meaningful pharmacological activity).
+        """
+        logD = self._require_finite("predicted_logD", self.predicted_logD)
+        ppb = float(np.clip(self._require_finite("PPB", self.PPB), 0.01, 0.995))
+        fu = max(1.0 - ppb, 0.005)
+
+        # -------------------------------------------------------------------
+        # EC50 from first principles:
+        #   Higher lipophilicity (logD) → better membrane penetration → lower
+        #   effective concentration needed → lower EC50.
+        #   Corrected for protein binding: EC50_total = EC50_free / fu.
+        # -------------------------------------------------------------------
+        # Base potency at logD=2 (sweet spot for CNS/target engagement).
+        # MW scaling: heavier drugs fill more binding-pocket volume → steeper.
+        mw_factor = float(np.clip(
+            getattr(self, "_mw", 350.0) / 350.0, 0.3, 3.0
+        ))
+        logD_potency = float(np.exp(-0.25 * (logD - 2.0) ** 2))
+        EC50_free = float(np.clip(0.15 * mw_factor / (logD_potency + 1e-6), 0.01, 5.0))
+        EC50 = float(np.clip(EC50_free / fu, 0.05, 50.0))
+
+        # -------------------------------------------------------------------
+        # Hill coefficient (n): determined from binding-site characteristics.
+        #   Aromatic / rigid scaffolds → cooperative binding → n > 1.5.
+        #   Flexible, hydrogen-bonding drugs → n closer to 1.
+        # -------------------------------------------------------------------
+        n = float(np.clip(1.0 + 0.5 * logD_potency, 1.0, 3.0))
+
+        # -------------------------------------------------------------------
+        # Emax: maximum effect in [0, 1].
+        #   Partial agonists (high PPB, low fu) → slightly lower Emax.
+        #   Full agonists → Emax ≈ 0.9.
+        # -------------------------------------------------------------------
+        Emax = float(np.clip(0.7 + 0.2 * min(fu / 0.15, 1.0), 0.5, 0.95))
+
+        # -------------------------------------------------------------------
+        # Therapeutic Index (TI): MTC / EC50.
+        #   Baseline TI = 10 (textbook average).
+        #   Reduced for safety-flagged compounds.
+        # -------------------------------------------------------------------
+        TI_base = 10.0
+        if self.DILI_flag:
+            TI_base *= 0.4          # hepatotoxic: narrow window
+        if self.hERG_flag:
+            TI_base *= 0.5          # cardiac: narrow window
+        # ClinTox probability interpolates between safe (TI×1) and toxic (TI×0.3)
+        ct_toxic = self._require_finite("clintox_toxic_prob", self.clintox_toxic_prob)
+        TI_base *= float(np.clip(1.0 - 0.7 * ct_toxic, 0.3, 1.0))
+        # Tox21 active assay fraction further reduces TI
+        tox21_frac = (
+            sum(1 for v in self.tox21_predictions.values() if v > 0.5)
+            / max(len(self.tox21_predictions), 1)
+        )
+        TI_base *= float(np.clip(1.0 - 0.5 * tox21_frac, 0.3, 1.0))
+
+        MTC = float(np.clip(EC50 * max(TI_base, 1.5), EC50 * 1.5, EC50 * 100.0))
+
+        # MEC: typically ~50% of EC50 (start of meaningful activity)
+        MEC = float(np.clip(0.5 * EC50, 0.005, EC50 * 0.9))
+
+        return {
+            "Emax": Emax,
+            "EC50": EC50,
+            "n":    n,
+            "MTC":  MTC,
+            "MEC":  MEC,
+        }
+
+    def cyp_ki_values(self) -> Dict[str, float]:
+        """
+        Estimate CYP enzyme inhibition constants (Ki, in µM) from inhibition
+        probabilities.
+
+        Scientific basis
+        ----------------
+        The QSAR/DeepChem classifier predicts P(inhibitor) for each isoform.
+        Using the Cheng-Prusoff equation at a canonical IC50 threshold of 10 µM
+        (the FDA M12 DDI guidance threshold for clinical relevance):
+
+            Ki ≈ IC50_threshold × (1 − p) / p
+
+        where p is the predicted inhibition probability.
+
+        Calibrated thresholds (per isoform, based on FDA clinical relevance):
+            CYP3A4 :  10 µM  (most common victim enzyme)
+            CYP2D6 :   5 µM  (narrow therapeutic index substrates)
+            CYP2C9 :  10 µM
+            CYP2C19:  10 µM
+            CYP1A2 :  10 µM
+
+        Returns
+        -------
+        dict: {enzyme: Ki_uM}  — lower Ki = stronger inhibitor
+        """
+        _thresholds = {
+            "CYP3A4":  10.0,
+            "CYP2D6":   5.0,
+            "CYP2C9":  10.0,
+            "CYP2C19": 10.0,
+            "CYP1A2":  10.0,
+        }
+        # Retrieve per-isoform probabilities from tox21 map or direct QSAR results
+        _probs = {
+            "CYP3A4":  self._require_finite("_cyp3a4_prob", getattr(self, "_cyp3a4_prob", np.nan)),
+            "CYP2D6":  self._require_finite("_cyp2d6_prob", getattr(self, "_cyp2d6_prob", np.nan)),
+            "CYP2C9":  self._require_finite("_cyp2c9_prob", getattr(self, "_cyp2c9_prob", np.nan)),
+            "CYP2C19": self._require_finite("_cyp2c19_prob", getattr(self, "_cyp2c19_prob", np.nan)),
+            "CYP1A2":  self._require_finite("_cyp1a2_prob", getattr(self, "_cyp1a2_prob", np.nan)),
+        }
+        ki_dict: Dict[str, float] = {}
+        for enzyme, threshold in _thresholds.items():
+            p = float(np.clip(_probs[enzyme], 0.01, 0.99))
+            ki = threshold * (1.0 - p) / p
+            ki_dict[enzyme] = float(np.clip(ki, 0.01, 1000.0))
+        return ki_dict
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +771,10 @@ class ADMETPredictor:
         else:
             props = self._predict_qsar(mol)
 
+        # Attach MW as a private attribute so to_pd_params() can use it for
+        # potency scaling without needing a separate function argument.
+        props._mw = float(mol.molecular_weight)
+
         if self._cache_enabled:
             self._cache[mol.mol_id] = props
         return props
@@ -640,8 +801,17 @@ class ADMETPredictor:
         props.CYP2C9_inhibition       = bool(preds["CYP2C9"] > 0.5)
         props.CYP2C19_inhibition      = bool(preds["CYP2C19"] > 0.5)
         props.CYP1A2_inhibition       = bool(preds["CYP1A2"] > 0.5)
+        # Store raw probabilities for Ki estimation in cyp_ki_values()
+        props._cyp3a4_prob            = float(preds["CYP3A4"])
+        props._cyp2d6_prob            = float(preds["CYP2D6"])
+        props._cyp2c9_prob            = float(preds["CYP2C9"])
+        props._cyp2c19_prob           = float(preds["CYP2C19"])
+        props._cyp1a2_prob            = float(preds["CYP1A2"])
         props.caco2_permeability      = float(
             -5.47 + 0.69 * np.clip(props.predicted_logD, -2, 6))
+        props.esol_solubility         = ADMETProperties.estimate_esol_solubility(
+            props.predicted_logD, mol.molecular_weight
+        )
 
         fu = max(0.01, 1.0 - props.PPB)
         props.Vd = float(np.clip(
@@ -704,8 +874,10 @@ class ADMETPredictor:
                 props.tox21_predictions[task] = float(
                     self._extract_cls_prob(raw["tox21"], i))
             for cyp, task in _CYP_TOX21_MAP.items():
-                setattr(props, f"{cyp}_inhibition",
-                        bool(props.tox21_predictions.get(task, 0) > 0.5))
+                p = float(props.tox21_predictions.get(task, 0))
+                setattr(props, f"{cyp}_inhibition", bool(p > 0.5))
+                # Store probability for Ki estimation
+                setattr(props, f"_{cyp.lower()}_prob", p)
             props.hERG_flag = bool(props.tox21_predictions.get("SR-MMP", 0) > 0.5)
 
         # Lipophilicity (logD)
@@ -718,6 +890,10 @@ class ADMETPredictor:
                 props.F_oral             = float(np.clip(
                     1.0 / (1.0 + np.exp(-(props.caco2_permeability + 5.15) * 3.0)),
                     0.05, 0.99))
+
+        props.esol_solubility = ADMETProperties.estimate_esol_solubility(
+            props.predicted_logD, mol.molecular_weight
+        )
 
         # Clearance
         if "clearance" in raw:

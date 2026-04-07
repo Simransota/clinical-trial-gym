@@ -226,8 +226,10 @@ class PatientAgent:
         ind_pk["ka"]  = float(np.clip(ind_pk["ka"],  0.01, 10.0))
         ind_pk["F"]   = float(np.clip(ind_pk["F"],   0.01, 1.0))
 
-        # Individual PD params (EC50 has most IIV)
-        pop_pd = SurrogateODE.DEFAULT_PD_PARAMS
+        # Individual PD params (EC50 has most IIV).
+        # Population values come from ADMETProperties.to_pd_params() — these
+        # are drug-specific and molecularly derived, not hardcoded constants.
+        pop_pd = self.drug_profile.admet.to_pd_params()
         ind_pd = {
             "Emax": pop_pd["Emax"],
             "EC50": pop_pd["EC50"] * np.exp(eta_EC50),
