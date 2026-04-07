@@ -15,5 +15,11 @@ dependencies = [
   "pydantic>=2.12.5",
 ]
 
+[project.scripts]
+server = "server.app:main"
+
 [tool.setuptools]
 py-modules = ["__init__", "client", "models", "inference"]
+
+[tool.setuptools.packages.find]
+include = ["server"]
