@@ -56,7 +56,8 @@ import requests
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
 # Set OPENAI_API_KEY for the OpenAI client
-os.environ["OPENAI_API_KEY"] = API_KEY
+if API_KEY:
+    os.environ["OPENAI_API_KEY"] = API_KEY
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")

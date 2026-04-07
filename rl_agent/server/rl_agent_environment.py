@@ -505,6 +505,12 @@ class RlAgentEnvironment(Environment):
             "drug_name":    self.drug_name,
             "drug_params":  self.drug_params,
             "safety_flags": self.safety_flags,
+            "task_targets": dict(self._task_targets),
+            "safety_limits": {
+                "dlt_rate_limit": FDA_RULES["max_dlt_rate"],
+                "max_steps": FDA_RULES["max_steps"],
+                "max_dose_mgkg": FDA_RULES["max_dose_mg_kg"],
+            },
             "start_dose":   self._start_dose,
             "history":      self.history,
             "pk_traces":    self.pk_traces,

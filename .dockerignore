@@ -1,0 +1,10 @@
+.git
+.DS_Store
+.env
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+gym_env
+rl_agent/.venv
+analysis
