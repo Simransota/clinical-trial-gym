@@ -408,9 +408,8 @@ class RlAgentEnvironment(Environment):
         concentration-time curve for plotting. Returns a dict with time,
         blood_conc, tissue_conc arrays — ready for Layer 5 PK curve plots.
         """
-        from agents import PatientAgent as PA
-        # Clone a fresh patient with same parameters
-        p = PA(
+        # Clone a fresh patient with same parameters (PatientAgent already imported at module level)
+        p = PatientAgent(
             weight_kg      = patient.weight_kg,
             age            = patient.age,
             sex            = patient.sex,
@@ -444,6 +443,26 @@ class RlAgentEnvironment(Environment):
             "auc":           round(sum((blood[i] + blood[i+1]) / 2 * (times[i+1] - times[i])
                                        for i in range(len(times)-1)), 4),
         }
+
+    def configure_drug(self, drug_profile: dict) -> None:
+        """
+        Reconfigure the environment with a new drug profile from Layer 1+2.
+
+        Call this before reset() to apply the new molecule to the next episode.
+        Called automatically by the POST /drug endpoint.
+
+        Parameters
+        ----------
+        drug_profile : dict
+            Output of DrugProfileBuilder.build() — contains drug_params,
+            safety_flags, human_equivalent_dose, name, and admet_summary.
+        """
+        self.drug_name    = drug_profile.get("name", "investigational compound")
+        self.drug_params  = drug_profile.get("drug_params",  {})
+        self.safety_flags = drug_profile.get("safety_flags", {})
+        hed = drug_profile.get("human_equivalent_dose", None)
+        self._start_dose  = round(max(0.1, hed / 10.0), 3) if (hed and hed > 0) else 1.0
+        self.current_dose = self._start_dose
 
     def get_episode_data(self) -> dict:
         """

@@ -31,6 +31,8 @@ Usage:
 from dotenv import load_dotenv
 load_dotenv()
 from fastapi import Request
+from pydantic import BaseModel
+from typing import Optional
 try:
     from openenv.core.env_server.http_server import create_app
 except Exception as e:  # pragma: no cover
@@ -56,6 +58,63 @@ app = create_app(
 )
 
 # app.py — add this after create_app(...)
+
+class DrugRequest(BaseModel):
+    smiles: str
+    name: Optional[str] = "investigational compound"
+    source_species: Optional[str] = "rat"
+    animal_dose_mgkg: Optional[float] = 8.0
+
+
+@app.post("/drug")
+def configure_drug(req: DrugRequest):
+    """
+    Configure the environment with a real molecule from Layer 1+2.
+
+    Runs DrugProfileBuilder (RDKit → DeepChem ADMET → AllometricScaler) on the
+    provided SMILES string and applies the resulting drug profile to the
+    environment. The next /reset call will use this drug's PK parameters and
+    start at 1/10 of the computed HED.
+
+    Body:
+        smiles           : SMILES string, e.g. "CC(=O)Oc1ccccc1C(=O)O"
+        name             : drug name for logging (default "investigational compound")
+        source_species   : preclinical species (default "rat")
+        animal_dose_mgkg : reference dose for HED computation (default 8.0)
+
+    Returns:
+        status, drug name, HED, starting dose, and ADMET summary.
+    """
+    import sys, os
+    _repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if _repo not in sys.path:
+        sys.path.insert(0, _repo)
+
+    try:
+        from drug_profile_builder import DrugProfileBuilder
+    except ImportError:
+        sys.path.insert(0, os.path.join(_repo, "rl_agent"))
+        from drug_profile_builder import DrugProfileBuilder
+
+    builder = DrugProfileBuilder(
+        smiles=req.smiles,
+        name=req.name,
+        source_species=req.source_species,
+        animal_dose_mgkg=req.animal_dose_mgkg,
+    )
+    profile = builder.build()
+    env_instance = app.state.env
+    env_instance.configure_drug(profile)
+
+    return {
+        "status":       "configured",
+        "drug":         profile["name"],
+        "smiles":       profile["smiles"],
+        "hed_mgkg":     profile["human_equivalent_dose"],
+        "start_dose":   env_instance._start_dose,
+        "admet_summary": profile["admet_summary"],
+    }
+
 
 @app.get("/episode_data")
 def get_episode_data():
