@@ -183,10 +183,22 @@ def list_tasks():
     The competition validator appears to perform task validation separately
     from baseline execution, so this endpoint makes task/grader discovery
     unambiguous for both humans and automated checks.
+    
+    Includes smoke_score by attempting to call each grader to validate it works.
     """
     tasks = []
     for task in TASKS:
         grader = TASK_GRADERS.get(task["id"])
+        
+        # Try to compute smoke score by calling the grader
+        smoke_score = None
+        if grader and callable(grader):
+            try:
+                smoke_score = round(float(grader()), 3)
+            except Exception as e:
+                # If grader fails, still report the task but with error
+                smoke_score = None
+        
         tasks.append(
             {
                 "id": task["id"],
@@ -194,7 +206,7 @@ def list_tasks():
                 "description": task["description"],
                 "grader": task["grader"].__name__ if callable(task.get("grader")) else None,
                 "has_grader": grader is not None,
-                "smoke_score": None,
+                "smoke_score": smoke_score,
             }
         )
 
