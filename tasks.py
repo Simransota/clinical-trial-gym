@@ -1,26 +1,8 @@
-"""Repository-root task registry for RxGym hackathon validation."""
-
-# Import graders - try absolute import first (Docker/installed mode),
-# then fallback to relative/direct import (development/validation mode)
-try:
-    from server.graders import (
-        grade_allometric_scaling,
-        grade_combo_ddi,
-        grade_phase_i_dosing,
-    )
-except (ImportError, ModuleNotFoundError):
-    # Fallback: try importing directly
-    try:
-        from rl_agent.server.graders import (
-            grade_allometric_scaling,
-            grade_combo_ddi,
-            grade_phase_i_dosing,
-        )
-    except (ImportError, ModuleNotFoundError) as e:
-        raise ImportError(
-            f"Could not import graders. Tried both 'server.graders' and 'rl_agent.server.graders'. Error: {e}"
-        ) from e
-
+from graders import (
+    grade_phase_i_dosing,
+    grade_allometric_scaling,
+    grade_combo_ddi,
+)
 
 TASKS = [
     {
@@ -42,6 +24,5 @@ TASKS = [
         "grader": grade_combo_ddi,
     },
 ]
-
 
 TASK_IDS = [task["id"] for task in TASKS]
