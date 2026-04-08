@@ -47,17 +47,38 @@ import json
 import textwrap
 import sys
 import math
+import time
 from typing import List, Optional
 from openai import OpenAI
 
 # from my_env_v4 import MyEnvV4Action, MyEnvV4Env  # Not needed, using HTTP
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
 # Set OPENAI_API_KEY for the OpenAI client
 if API_KEY:
     os.environ["OPENAI_API_KEY"] = API_KEY
+
+# Create robust requests session with retry strategy
+def _create_session_with_retries():
+    """Create a requests session with exponential backoff retry strategy."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,  # Total number of retries
+        backoff_factor=1,  # Exponential backoff: 1s, 2s, 4s
+        status_forcelist=[408, 429, 500, 502, 503, 504],
+        allowed_methods=["POST", "GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+# Global session for connection pooling
+_SESSION = _create_session_with_retries()
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
@@ -260,12 +281,24 @@ def get_model_message(
 
 
 def env_reset() -> dict:
+    """Reset the environment with retry logic and increased timeout."""
     ENV_URL = os.getenv("ENV_URL", DEFAULT_ENV_URL)
-    resp = requests.post(f"{ENV_URL}/reset", timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = _SESSION.post(f"{ENV_URL}/reset", timeout=60, allow_redirects=True)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.Timeout, requests.ConnectionError, requests.RequestException) as e:
+            if attempt < max_attempts:
+                wait_time = min(30, 2 ** (attempt - 1))  # 1s, 2s, 4s, 8s, 16s, 30s
+                debug_log(f"env_reset attempt {attempt} failed: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise RuntimeError(f"env_reset failed after {max_attempts} attempts: {e}") from e
 
 def env_configure_drug(smiles: str, name: str, source_species: str, animal_dose_mgkg: float) -> dict:
+    """Configure drug with retry logic."""
     ENV_URL = os.getenv("ENV_URL", DEFAULT_ENV_URL)
     payload = {
         "smiles": smiles,
@@ -273,24 +306,44 @@ def env_configure_drug(smiles: str, name: str, source_species: str, animal_dose_
         "source_species": source_species,
         "animal_dose_mgkg": animal_dose_mgkg,
     }
-    resp = requests.post(f"{ENV_URL}/drug", json=payload, timeout=120)
-    if not resp.ok:
-        detail = None
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
         try:
-            detail = resp.json()
-        except Exception:
-            detail = resp.text
-        raise RuntimeError(f"/drug failed with HTTP {resp.status_code}: {detail}")
-    cfg = resp.json()
-    validate_drug_config_or_raise(cfg)
-    return cfg
-
+            resp = _SESSION.post(f"{ENV_URL}/drug", json=payload, timeout=120, allow_redirects=True)
+            if not resp.ok:
+                detail = None
+                try:
+                    detail = resp.json()
+                except Exception:
+                    detail = resp.text
+                raise RuntimeError(f"/drug failed with HTTP {resp.status_code}: {detail}")
+            cfg = resp.json()
+            validate_drug_config_or_raise(cfg)
+            return cfg
+        except (requests.Timeout, requests.ConnectionError, requests.RequestException) as e:
+            if attempt < max_attempts:
+                wait_time = min(30, 2 ** (attempt - 1))
+                debug_log(f"env_configure_drug attempt {attempt} failed: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise RuntimeError(f"env_configure_drug failed after {max_attempts} attempts: {e}") from e
 
 def env_step(action: dict) -> dict:
+    """Execute step with retry logic."""
     ENV_URL = os.getenv("ENV_URL", DEFAULT_ENV_URL)
-    resp = requests.post(f"{ENV_URL}/step", json={"action": action}, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = _SESSION.post(f"{ENV_URL}/step", json={"action": action}, timeout=60, allow_redirects=True)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.Timeout, requests.ConnectionError, requests.RequestException) as e:
+            if attempt < max_attempts:
+                wait_time = min(30, 2 ** (attempt - 1))
+                debug_log(f"env_step attempt {attempt} failed: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise RuntimeError(f"env_step failed after {max_attempts} attempts: {e}") from e
 
 
 def env_close() -> None:
@@ -813,31 +866,42 @@ def main() -> None:
     try:
         if USE_LLM_POLICY and client is None:
             debug_log("HF_TOKEN/API_KEY missing; falling back to deterministic controller for this run.")
-        drug_cfg_raw = env_configure_drug(
-            smiles=str(submission_drug["smiles"]),
-            name=str(submission_drug["name"]),
-            source_species=str(submission_drug["source_species"]),
-            animal_dose_mgkg=float(submission_drug["animal_dose_mgkg"]),
-        )
-        drug_cfg = drug_cfg_raw
-        fragility_profile = derive_fragility_profile(drug_cfg)
-        hed_anchor = float(drug_cfg.get("hed_mgkg", hed_anchor))
-        task_targets = resolve_task_targets(drug_cfg, hed_anchor)
-        cyp_inhibitions = list(fragility_profile.get("cyp_inhibitions", []) or [])
-        debug_log(f"/drug hed_mgkg={hed_anchor:.4f}")
-        debug_log(f"/drug admet_summary={json.dumps(drug_cfg.get('admet_summary', {}), sort_keys=True)}")
-        debug_log(f"/drug drug_params={json.dumps(drug_cfg.get('drug_params', {}), sort_keys=True)}")
-        debug_log(
-            f"/drug derived fragility={fragility_profile['fragility']:.4f} "
-            f"high_fragility={fragility_profile['high_fragility']} "
-            f"first_step_cap_mult={fragility_profile['first_step_cap_mult']}"
-        )
-        debug_log(f"/drug cyp_inhibitions={cyp_inhibitions}")
-        result = env_reset()
-        obs, _, done = normalize_env_response(result)
-        current_dose = float(obs.get("dose_level", 1.0))
-        observations_seen.append(obs)
-        dose_history.append(current_dose)
+        
+        # Configure drug with error handling
+        try:
+            drug_cfg_raw = env_configure_drug(
+                smiles=str(submission_drug["smiles"]),
+                name=str(submission_drug["name"]),
+                source_species=str(submission_drug["source_species"]),
+                animal_dose_mgkg=float(submission_drug["animal_dose_mgkg"]),
+            )
+            drug_cfg = drug_cfg_raw
+            fragility_profile = derive_fragility_profile(drug_cfg)
+            hed_anchor = float(drug_cfg.get("hed_mgkg", hed_anchor))
+            task_targets = resolve_task_targets(drug_cfg, hed_anchor)
+            cyp_inhibitions = list(fragility_profile.get("cyp_inhibitions", []) or [])
+            debug_log(f"/drug hed_mgkg={hed_anchor:.4f}")
+            debug_log(f"/drug admet_summary={json.dumps(drug_cfg.get('admet_summary', {}), sort_keys=True)}")
+            debug_log(f"/drug drug_params={json.dumps(drug_cfg.get('drug_params', {}), sort_keys=True)}")
+            debug_log(
+                f"/drug derived fragility={fragility_profile['fragility']:.4f} "
+                f"high_fragility={fragility_profile['high_fragility']} "
+                f"first_step_cap_mult={fragility_profile['first_step_cap_mult']}"
+            )
+            debug_log(f"/drug cyp_inhibitions={cyp_inhibitions}")
+        except Exception as e:
+            debug_log(f"Drug configuration failed: {e}. Using defaults.")
+        
+        # Reset environment with error handling
+        try:
+            result = env_reset()
+            obs, _, done = normalize_env_response(result)
+            current_dose = float(obs.get("dose_level", 1.0))
+            observations_seen.append(obs)
+            dose_history.append(current_dose)
+        except Exception as e:
+            debug_log(f"Environment reset failed: {e}. Aborting episode.")
+            raise
 
         for step in range(1, MAX_STEPS + 1):
             if done:
@@ -868,28 +932,38 @@ def main() -> None:
 
             # Optional LLM policy mode; deterministic policy remains benchmark default.
             if USE_LLM_POLICY and client is not None:
-                message = get_model_message(
-                    client=client,
-                    obs=obs,
-                    step=step,
-                    task_name=TASK_NAME,
-                    hed=hed_anchor,
-                    dose_history=dose_history,
-                    reward_history=rewards,
-                    cumulative_dlt_rate=cumulative_dlt_rate,
-                    organ_risk_trend=organ_risk_trend,
-                )
-                action = parse_action(message, current_dose)
-            result = env_step(action)
-            obs, reward, done = normalize_env_response(result)
-            observations_seen.append(obs)
-            current_dose = float(obs.get("dose_level", current_dose))
-            dose_history.append(current_dose)
-            rewards.append(reward)
-            actions_taken.append(action)
-            steps_taken = step
-            log_step(step=step, action=json.dumps(action),
-                     reward=reward, done=done, error=None)
+                try:
+                    message = get_model_message(
+                        client=client,
+                        obs=obs,
+                        step=step,
+                        task_name=TASK_NAME,
+                        hed=hed_anchor,
+                        dose_history=dose_history,
+                        reward_history=rewards,
+                        cumulative_dlt_rate=cumulative_dlt_rate,
+                        organ_risk_trend=organ_risk_trend,
+                    )
+                    action = parse_action(message, current_dose)
+                except Exception as e:
+                    debug_log(f"LLM policy failed at step {step}: {e}. Falling back to deterministic.")
+            
+            # Execute step with error handling
+            try:
+                result = env_step(action)
+                obs, reward, done = normalize_env_response(result)
+                observations_seen.append(obs)
+                current_dose = float(obs.get("dose_level", current_dose))
+                dose_history.append(current_dose)
+                rewards.append(reward)
+                actions_taken.append(action)
+                steps_taken = step
+                log_step(step=step, action=json.dumps(action),
+                         reward=reward, done=done, error=None)
+            except Exception as e:
+                debug_log(f"env_step failed at step {step}: {e}. Terminating episode.")
+                break
+            
             if done:
                 break
 
@@ -903,6 +977,10 @@ def main() -> None:
         )
         success = score >= SUCCESS_SCORE_THRESHOLD
 
+    except Exception as exc:
+        debug_log(f"Fatal error in main: {exc}")
+        import traceback
+        debug_log(traceback.format_exc())
     finally:
         try:
             env_close()
