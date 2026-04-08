@@ -140,7 +140,7 @@ class RlAgentEnvironment(Environment):
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
-    def __init__(self, drug_profile: dict = None):
+    def __init__(self, drug_profile: dict = None, use_llm: bool = True):
         self._state    = State(episode_id=str(uuid4()), step_count=0)
         self.cohort       = []
         self.history      = []
@@ -148,7 +148,7 @@ class RlAgentEnvironment(Environment):
         self.cohort_log   = []   # list[list[dict]] — per-step patient demographics + outcomes
         self.rp2d_dose    = None
         self._done        = False
-        self._use_llm  = True
+        self._use_llm  = use_llm
         self.doctor    = DoctorAgent() if self._use_llm else None
 
         # ── Unpack drug profile from Layer 1/2 ───────────────────────────────
