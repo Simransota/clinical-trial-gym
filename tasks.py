@@ -1,3 +1,5 @@
+"""Repository-root task registry for RxGym hackathon validation."""
+
 from graders import (
     grade_phase_i_dosing,
     grade_allometric_scaling,
