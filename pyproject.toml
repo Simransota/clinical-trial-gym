@@ -20,8 +20,21 @@ server = "server.app:main"
 
 [tool.setuptools]
 include-package-data = true
-py-modules = ["__init__", "client", "models", "inference", "tasks"]
+py-modules = ["__init__", "client", "models", "inference", "tasks", "graders"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["server", "rl_agent", "rl_agent.*"]
+
+[tool.openenv]
+tasks = [
+  "tasks:phase_i_dosing",
+  "tasks:allometric_scaling",
+  "tasks:combo_ddi",
+]
+
+graders = [
+  "graders:grade_phase_i_dosing",
+  "graders:grade_allometric_scaling",
+  "graders:grade_combo_ddi",
+]
