@@ -34,7 +34,7 @@ tasks = [
 ]
 
 graders = [
-  "graders:grade_phase_i_dosing",
-  "graders:grade_allometric_scaling",
-  "graders:grade_combo_ddi",
+  "rl_agent.server.graders:grade_phase_i_dosing",
+  "rl_agent.server.graders:grade_allometric_scaling",
+  "rl_agent.server.graders:grade_combo_ddi",
 ]
