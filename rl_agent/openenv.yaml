@@ -7,10 +7,13 @@ port: 8000
 tasks:
   - id: phase_i_dosing
     difficulty: easy
-    description: "Single drug Phase I dose escalation — find RP2D safely"
+    description: "Single-agent Phase I dose escalation to identify an RP2D from molecule-derived PK/PD and toxicity signals."
+    grader: server.graders:grade_phase_i_dosing
   - id: allometric_scaling
     difficulty: medium
-    description: "Translate rodent dose to human equivalent"
+    description: "Translate a preclinical rat dose into a human-equivalent dose and refine it from observed human PK."
+    grader: server.graders:grade_allometric_scaling
   - id: combo_ddi
     difficulty: hard
-    description: "Multi-drug combo scheduling minimizing drug-drug interactions"
+    description: "Schedule a two-drug regimen while controlling mechanistic CYP-mediated drug-drug interaction risk."
+    grader: server.graders:grade_combo_ddi
