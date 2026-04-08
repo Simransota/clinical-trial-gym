@@ -191,7 +191,17 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     # Always emit at least one reward value so the parser regex matches even
     # when an episode aborts before any successful env.step() call.
     rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else "0.00"
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
+    # Validator requires score strictly inside (0, 1); never emit 0.00 or 1.00.
+    safe_score = _strict_unit_clamp(float(score))
+    # Ensure 2-decimal printing also stays inside the open interval, since
+    # f"{0.999:.2f}" rounds to "1.00" and f"{0.001:.2f}" rounds to "0.00".
+    if safe_score >= 0.995:
+        score_str = "0.99"
+    elif safe_score <= 0.005:
+        score_str = "0.01"
+    else:
+        score_str = f"{safe_score:.2f}"
+    print(f"[END] success={str(success).lower()} steps={steps} score={score_str} rewards={rewards_str}", flush=True)
 
 
 def debug_log(message: str) -> None:
@@ -754,6 +764,19 @@ def choose_action(
     return {"next_dose": round(next_dose, 4), "cohort_size": dynamic_cohort, "escalate": True}
 
 
+# Validator requires every task score to be strictly inside (0, 1) — never
+# exactly 0.0 or 1.0 — so all scoring paths funnel through this clamp.
+SCORE_FLOOR = 0.001
+SCORE_CEIL = 0.999
+
+
+def _strict_unit_clamp(value: float) -> float:
+    """Clamp to the open interval (0, 1) required by the Phase 2 validator."""
+    if value != value:  # NaN guard
+        return SCORE_FLOOR
+    return float(max(SCORE_FLOOR, min(SCORE_CEIL, value)))
+
+
 def compute_terminal_score(
     task_name: str,
     rewards: List[float],
@@ -763,10 +786,10 @@ def compute_terminal_score(
     task_targets: dict,
 ) -> float:
     """
-    Episode-quality score in [0,1] that is more informative than clipped reward sum.
+    Episode-quality score strictly inside (0, 1).
     """
     if not rewards:
-        return 0.0
+        return _strict_unit_clamp(0.0)
     avg_reward = sum(rewards) / len(rewards)
     dlt_rates = [
         float(obs.get("dlt_count", 0)) / max(1.0, float(obs.get("cohort_size", 3)))
@@ -780,7 +803,7 @@ def compute_terminal_score(
         err = abs(first - target) / max(target, 1e-6)
         closeness = max(0.0, 1.0 - err)
         score = 0.75 * closeness + 0.25 * safety
-        return float(min(1.0, max(0.0, score)))
+        return _strict_unit_clamp(score)
 
     if task_name == "combo_ddi":
         max_dose = max((a["next_dose"] for a in actions), default=0.0)
@@ -793,7 +816,7 @@ def compute_terminal_score(
                 if risk > 0.35:
                     risk_penalty += 0.08
         score = 0.45 * efficacy + 0.35 * safety + 0.20 * avg_reward - risk_penalty
-        return float(min(1.0, max(0.0, score)))
+        return _strict_unit_clamp(score)
 
     # phase_i_dosing
     max_safe_dose = 0.0
@@ -807,7 +830,7 @@ def compute_terminal_score(
     if max_safe_dose < 0.7 * target and len(actions) >= max(6, int(0.75 * MAX_STEPS)):
         late_underdose_penalty = 0.20
     score = 0.55 * closeness + 0.25 * safety + 0.20 * avg_reward - late_underdose_penalty
-    return float(min(1.0, max(0.0, score)))
+    return _strict_unit_clamp(score)
 
 
 def parse_action(response_text: str, current_dose: float) -> dict:
