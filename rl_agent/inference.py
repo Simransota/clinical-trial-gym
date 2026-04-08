@@ -188,7 +188,9 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    # Always emit at least one reward value so the parser regex matches even
+    # when an episode aborts before any successful env.step() call.
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else "0.00"
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
 
 
@@ -835,9 +837,11 @@ def parse_action(response_text: str, current_dose: float) -> dict:
         }
 
 
-def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY) if API_KEY else None
+ALL_TASK_NAMES: List[str] = ["phase_i_dosing", "allometric_scaling", "combo_ddi"]
 
+
+def run_task(task_name: str, client: Optional[OpenAI]) -> float:
+    """Run one episode for a single task and emit a [START]/[STEP]/[END] block."""
     rewards: List[float] = []
     actions_taken: List[dict] = []
     observations_seen: List[dict] = []
@@ -845,7 +849,7 @@ def main() -> None:
     steps_taken = 0
     score = 0.0
     success = False
-    submission_drug = resolve_submission_drug(TASK_NAME)
+    submission_drug = resolve_submission_drug(task_name)
     hed_anchor = max(0.1, float(submission_drug["animal_dose_mgkg"]) * 6.0 / 37.0)
     cyp_inhibitions: List[str] = []
     task_targets = {
@@ -861,12 +865,12 @@ def main() -> None:
         "cyp_inhibitions": [],
     }
 
-    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
     try:
         if USE_LLM_POLICY and client is None:
             debug_log("HF_TOKEN/API_KEY missing; falling back to deterministic controller for this run.")
-        
+
         # Configure drug with error handling
         try:
             drug_cfg_raw = env_configure_drug(
@@ -880,18 +884,18 @@ def main() -> None:
             hed_anchor = float(drug_cfg.get("hed_mgkg", hed_anchor))
             task_targets = resolve_task_targets(drug_cfg, hed_anchor)
             cyp_inhibitions = list(fragility_profile.get("cyp_inhibitions", []) or [])
-            debug_log(f"/drug hed_mgkg={hed_anchor:.4f}")
-            debug_log(f"/drug admet_summary={json.dumps(drug_cfg.get('admet_summary', {}), sort_keys=True)}")
-            debug_log(f"/drug drug_params={json.dumps(drug_cfg.get('drug_params', {}), sort_keys=True)}")
+            debug_log(f"[{task_name}] /drug hed_mgkg={hed_anchor:.4f}")
+            debug_log(f"[{task_name}] /drug admet_summary={json.dumps(drug_cfg.get('admet_summary', {}), sort_keys=True)}")
+            debug_log(f"[{task_name}] /drug drug_params={json.dumps(drug_cfg.get('drug_params', {}), sort_keys=True)}")
             debug_log(
-                f"/drug derived fragility={fragility_profile['fragility']:.4f} "
+                f"[{task_name}] /drug derived fragility={fragility_profile['fragility']:.4f} "
                 f"high_fragility={fragility_profile['high_fragility']} "
                 f"first_step_cap_mult={fragility_profile['first_step_cap_mult']}"
             )
-            debug_log(f"/drug cyp_inhibitions={cyp_inhibitions}")
+            debug_log(f"[{task_name}] /drug cyp_inhibitions={cyp_inhibitions}")
         except Exception as e:
-            debug_log(f"Drug configuration failed: {e}. Using defaults.")
-        
+            debug_log(f"[{task_name}] Drug configuration failed: {e}. Using defaults.")
+
         # Reset environment with error handling
         try:
             result = env_reset()
@@ -900,7 +904,7 @@ def main() -> None:
             observations_seen.append(obs)
             dose_history.append(current_dose)
         except Exception as e:
-            debug_log(f"Environment reset failed: {e}. Aborting episode.")
+            debug_log(f"[{task_name}] Environment reset failed: {e}. Aborting episode.")
             raise
 
         for step in range(1, MAX_STEPS + 1):
@@ -919,7 +923,7 @@ def main() -> None:
             )
 
             action = choose_action(
-                TASK_NAME,
+                task_name,
                 obs,
                 current_dose,
                 actions_taken,
@@ -937,7 +941,7 @@ def main() -> None:
                         client=client,
                         obs=obs,
                         step=step,
-                        task_name=TASK_NAME,
+                        task_name=task_name,
                         hed=hed_anchor,
                         dose_history=dose_history,
                         reward_history=rewards,
@@ -946,8 +950,8 @@ def main() -> None:
                     )
                     action = parse_action(message, current_dose)
                 except Exception as e:
-                    debug_log(f"LLM policy failed at step {step}: {e}. Falling back to deterministic.")
-            
+                    debug_log(f"[{task_name}] LLM policy failed at step {step}: {e}. Falling back to deterministic.")
+
             # Execute step with error handling
             try:
                 result = env_step(action)
@@ -961,14 +965,14 @@ def main() -> None:
                 log_step(step=step, action=json.dumps(action),
                          reward=reward, done=done, error=None)
             except Exception as e:
-                debug_log(f"env_step failed at step {step}: {e}. Terminating episode.")
+                debug_log(f"[{task_name}] env_step failed at step {step}: {e}. Terminating episode.")
                 break
-            
+
             if done:
                 break
 
         score = compute_terminal_score(
-            task_name=TASK_NAME,
+            task_name=task_name,
             rewards=rewards,
             actions=actions_taken,
             observations=observations_seen,
@@ -978,16 +982,44 @@ def main() -> None:
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as exc:
-        debug_log(f"Fatal error in main: {exc}")
+        debug_log(f"[{task_name}] Fatal error in run_task: {exc}")
         import traceback
         debug_log(traceback.format_exc())
     finally:
         try:
             env_close()
         except Exception as exc:
-            debug_log(f"env_close failed: {exc}")
+            debug_log(f"[{task_name}] env_close failed: {exc}")
         log_end(success=success, steps=steps_taken,
                 score=score, rewards=rewards)
+
+    return score
+
+
+def main() -> None:
+    """Run inference for all benchmark tasks so the validator can discover 3+ tasks."""
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY) if API_KEY else None
+
+    # Honor TASK_NAME env var only if it explicitly selects a single task
+    # AND the user opts out of multi-task mode. Default: run all 3 tasks.
+    single_task_only = os.getenv("RUN_SINGLE_TASK", "0").lower() in ("1", "true", "yes")
+    if single_task_only and TASK_NAME in ALL_TASK_NAMES:
+        task_list = [TASK_NAME]
+    else:
+        task_list = list(ALL_TASK_NAMES)
+
+    scores: dict = {}
+    for task_name in task_list:
+        try:
+            scores[task_name] = run_task(task_name, client)
+        except Exception as exc:
+            debug_log(f"Task {task_name} aborted with unrecoverable error: {exc}")
+            scores[task_name] = 0.0
+
+    # Optional summary line on stderr; the validator parses [START]/[STEP]/[END] only.
+    if scores:
+        avg = sum(scores.values()) / len(scores)
+        debug_log("FINAL SCORES " + ", ".join(f"{k}={v:.2f}" for k, v in scores.items()) + f", avg={avg:.2f}")
 
 
 if __name__ == "__main__":
