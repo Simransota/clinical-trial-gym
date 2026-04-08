@@ -43,9 +43,13 @@ except Exception as e:  # pragma: no cover
 
 try:
     from ..models import RlAgentAction, RlAgentObservation
+    from ..tasks import TASKS
+    from .graders import TASK_GRADERS
     from .rl_agent_environment import RlAgentEnvironment
 except ModuleNotFoundError:
     from models import RlAgentAction, RlAgentObservation
+    from rl_agent.tasks import TASKS
+    from server.graders import TASK_GRADERS
     from server.rl_agent_environment import RlAgentEnvironment
 
 
@@ -168,6 +172,36 @@ def get_episode_data():
     """Episode data is only available in persistent WebSocket sessions."""
     return {
         "error": "episode_data is unavailable in stateless HTTP mode. Use /ws for persistent sessions."
+    }
+
+
+@app.get("/tasks")
+def list_tasks():
+    """
+    Expose task metadata and grader availability explicitly.
+
+    The competition validator appears to perform task validation separately
+    from baseline execution, so this endpoint makes task/grader discovery
+    unambiguous for both humans and automated checks.
+    """
+    tasks = []
+    for task in TASKS:
+        grader = TASK_GRADERS.get(task["id"])
+        tasks.append(
+            {
+                "id": task["id"],
+                "difficulty": task["difficulty"],
+                "description": task["description"],
+                "grader": task["grader"],
+                "has_grader": grader is not None,
+                "smoke_score": None,
+            }
+        )
+
+    return {
+        "environment": "rxgym",
+        "task_count": len(tasks),
+        "tasks": tasks,
     }
 
 def main(host: str = "0.0.0.0", port: int = 8000):

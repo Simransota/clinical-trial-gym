@@ -19,7 +19,9 @@ dependencies = [
 server = "server.app:main"
 
 [tool.setuptools]
-py-modules = ["__init__", "client", "models", "inference"]
+include-package-data = true
+py-modules = ["__init__", "client", "models", "inference", "tasks"]
 
 [tool.setuptools.packages.find]
-include = ["server"]
+where = ["."]
+include = ["server", "rl_agent", "rl_agent.*"]

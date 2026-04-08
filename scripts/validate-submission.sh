@@ -31,15 +31,21 @@ assert manifest["name"] == "rxgym"
 assert len(manifest["tasks"]) >= 3
 for task in manifest["tasks"]:
     assert task["difficulty"] in {"easy", "medium", "hard"}
+    assert task.get("grader"), f"missing grader for task {task.get('id')}"
 print("openenv.yaml ok")
 PY
 
 echo "[5/5] baseline smoke test"
 python - <<PY
 from pathlib import Path
+import importlib
 src = Path("${REPO_DIR}/inference.py").read_text()
 assert "[START]" in Path("${REPO_DIR}/rl_agent/inference.py").read_text()
 assert "OpenAI" in Path("${REPO_DIR}/rl_agent/inference.py").read_text()
+task_mod = importlib.import_module("tasks")
+grader_mod = importlib.import_module("server.graders")
+assert len(getattr(task_mod, "TASKS", [])) >= 3
+assert len(getattr(grader_mod, "TASK_GRADERS", {})) >= 3
 print("baseline script structure ok")
 PY
 
