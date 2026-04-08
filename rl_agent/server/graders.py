@@ -15,6 +15,10 @@ def _fresh_env_with_episode(steps: int = 3) -> RlAgentEnvironment:
         from models import RlAgentAction
 
     env = RlAgentEnvironment()
+    # Disable LLM to avoid slow/hanging API calls during grader smoke tests.
+    # Doctor recommendations don't affect grading scores.
+    env._use_llm = False
+    env.doctor = None
     env.reset()
     for _ in range(steps):
         action = RlAgentAction(next_dose=2.0, cohort_size=3, escalate=True)
