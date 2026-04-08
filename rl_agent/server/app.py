@@ -192,7 +192,7 @@ def list_tasks():
                 "id": task["id"],
                 "difficulty": task["difficulty"],
                 "description": task["description"],
-                "grader": task["grader"],
+                "grader": task["grader"].__name__ if callable(task.get("grader")) else None,
                 "has_grader": grader is not None,
                 "smoke_score": None,
             }
