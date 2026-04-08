@@ -58,6 +58,42 @@ from uuid import uuid4
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
 
+# Default drug profile (aspirin-like) used when no molecule is configured.
+# This lets the Phase 2 evaluator run episodes and invoke graders without
+# needing to POST /drug first.
+DEFAULT_DRUG_PROFILE = {
+    "name": "default_compound",
+    "smiles": "CC(=O)Oc1ccccc1C(=O)O",
+    "drug_params": {
+        "ka": 0.1127,
+        "F": 0.80,
+        "CL": 0.50,
+        "Vc": 2.4746,
+        "Vp": 1.6497,
+        "Q": 0.30,
+        "PPB": 0.6048,
+        "fu": 0.3952,
+    },
+    "safety_flags": {
+        "dili_risk": False,
+        "herg_risk": False,
+        "cyp_inhibitions": [],
+        "bbb_penetrant": False,
+        "overall_risk_score": 0.1,
+    },
+    "human_equivalent_dose": 1.62,
+    "task_targets": {
+        "phase_i_dosing": 1.62,
+        "allometric_scaling": 1.62,
+        "combo_ddi": 1.62,
+    },
+    "admet_summary": {
+        "solubility": "moderate",
+        "permeability": "high",
+        "plasma_protein_binding": 0.6048,
+    },
+}
+
 try:
     from ..models import RlAgentAction, RlAgentObservation
 except ImportError:
@@ -128,8 +164,7 @@ class RlAgentEnvironment(Environment):
             "allometric_scaling": None,
             "combo_ddi": None,
         }
-        if drug_profile:
-            self.configure_drug(drug_profile)
+        self.configure_drug(drug_profile if drug_profile else DEFAULT_DRUG_PROFILE)
 
         self.current_dose = self._start_dose
 
@@ -164,10 +199,6 @@ class RlAgentEnvironment(Environment):
     # ── reset() ─────────────────────────────────────────────────────────────
     def reset(self) -> RlAgentObservation:
         """Start a fresh trial episode."""
-        if not self._drug_configured:
-            raise RuntimeError(
-                "No drug configured. Submit a molecule via /drug before calling /reset."
-            )
         self._state       = State(episode_id=str(uuid4()), step_count=0)
         self.current_dose = self._start_dose
         self.history      = []
@@ -201,10 +232,6 @@ class RlAgentEnvironment(Environment):
     # ── step() ──────────────────────────────────────────────────────────────
     def step(self, action: RlAgentAction) -> RlAgentObservation:
         self._configure_from_action(action)
-        if not self._drug_configured:
-            raise RuntimeError(
-                "No drug configured. Submit a molecule via /drug before calling /step."
-            )
         self._state.step_count += 1
 
         # 1. Record previous dose before updating (used by reward)
