@@ -18,6 +18,29 @@ RxGym doesn't simulate a toy grid-world. It simulates the actual decision-making
 
 ---
 
+## Live Demo
+
+The environment is deployed on Hugging Face Spaces and can be accessed directly:
+
+| Interface | URL | Description |
+|-----------|-----|-------------|
+| **Visual Dashboard** | [simransota-clinical-trial-env.hf.space/dashboard](https://simransota-clinical-trial-env.hf.space/dashboard) | Gradio UI with preset drugs, one-click trial simulation, and 6-panel visualizations |
+| **OpenEnv Playground** | [simransota-clinical-trial-env.hf.space](https://simransota-clinical-trial-env.hf.space/) | Interactive API playground — type actions, see observations, step through a trial |
+| **API Endpoints** | [simransota-clinical-trial-env.hf.space/docs](https://simransota-clinical-trial-env.hf.space/docs) | Swagger/OpenAPI documentation for all REST endpoints |
+
+### For Evaluators
+
+The fastest way to evaluate RxGym:
+
+1. Open the **[Visual Dashboard](https://simransota-clinical-trial-env.hf.space/dashboard)**
+2. Select a preset drug from the dropdown (Acetaminophen, Naproxen, Diazepam, Aspirin, or Ibuprofen) — or choose **"Custom"** and enter any SMILES string
+3. Click **"Run Trial Simulation"**
+4. Explore the 6 visualization panels and the episode summary
+
+No setup, no API keys, no Docker — just click and explore.
+
+---
+
 ## Why This Exists
 
 Nature Digital Medicine (2025) explicitly calls for *"validated, scalable frameworks combining RL-driven protocol optimization with adaptive trial designs"* — and notes that **such frameworks do not yet exist**. RxGym is a direct answer to that call.
@@ -226,29 +249,6 @@ python inference.py
 docker build -t rxgym .
 docker run --rm -p 8000:8000 rxgym
 ```
-
----
-
-## Live Demo
-
-The environment is deployed on Hugging Face Spaces and can be accessed directly:
-
-| Interface | URL | Description |
-|-----------|-----|-------------|
-| **Visual Dashboard** | [simransota-clinical-trial-env.hf.space/dashboard](https://simransota-clinical-trial-env.hf.space/dashboard) | Gradio UI with preset drugs, one-click trial simulation, and 6-panel visualizations |
-| **OpenEnv Playground** | [simransota-clinical-trial-env.hf.space](https://simransota-clinical-trial-env.hf.space/) | Interactive API playground — type actions, see observations, step through a trial |
-| **API Endpoints** | [simransota-clinical-trial-env.hf.space/docs](https://simransota-clinical-trial-env.hf.space/docs) | Swagger/OpenAPI documentation for all REST endpoints |
-
-### For Evaluators
-
-The fastest way to evaluate RxGym:
-
-1. Open the **[Visual Dashboard](https://simransota-clinical-trial-env.hf.space/dashboard)**
-2. Select a preset drug from the dropdown (Acetaminophen, Naproxen, Diazepam, Aspirin, or Ibuprofen) — or choose **"Custom"** and enter any SMILES string
-3. Click **"Run Trial Simulation"**
-4. Explore the 6 visualization panels and the episode summary
-
-No setup, no API keys, no Docker — just click and explore.
 
 ---
 
