@@ -28,65 +28,19 @@ Clinical trials are the slowest, most expensive, and most failure-prone step in 
 
 ## Architecture: 6 Layers, One Pipeline
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  SMILES String (e.g., CC(=O)NC1=CC=C(O)C=C1)           │
-└──────────────────────┬──────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│  Layer 1: Cheminformatics (RDKit + DeepChem)             │
-│  ├─ 14 molecular descriptors (MolWt, LogP, TPSA, ...)   │
-│  ├─ QED score, Lipinski Ro5, PAINS filter                │
-│  └─ ADMET: F_oral, PPB, BBB, CYP inhibition, DILI,      │
-│     hERG, ClinTox, Tox21 (GraphConv + QSAR fallback)    │
-└──────────────────────┬──────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│  Layer 2: Physiological PK/PD Engine                     │
-│  ├─ Allometric scaling (Boxenbaum 1982, 5 species)       │
-│  ├─ Mahmood brain-weight correction for CNS drugs        │
-│  ├─ FDA Km-factor HED computation (FDA Guidance 2005)    │
-│  ├─ 2-compartment ODE (RK45) + Emax/Hill PD model       │
-│  ├─ BioGears-calibrated surrogate with IIV (log-normal)  │
-│  └─ Mechanistic CYP450 DDI (FDA M12 static model)       │
-└──────────────────────┬──────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│  Layer 3: Multi-Agent Biological Simulation               │
-│  ├─ PatientAgent — per-patient PK with IIV, sex, age     │
-│  ├─ HepatocyteAgent — CYP450 saturation / liver stress   │
-│  ├─ ImmuneAgent — IL-6 cytokine storm signal             │
-│  ├─ RenalAgent — GFR decline tracking                    │
-│  ├─ MeasurementAgent — NCI CTCAE lab grading             │
-│  └─ DoctorAgent — LLM-powered clinical reasoning         │
-└──────────────────────┬──────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│  Layer 4: RL Environment + FDA Safety Wrapper             │
-│  ├─ Gymnasium-compliant reset()/step()/state()           │
-│  ├─ Hard-constraint safety layer (DLT thresholds,        │
-│  │   forced de-escalation — overrides agent actions)     │
-│  ├─ Multi-objective reward: [safety, progress,           │
-│  │   stopping, organ_health] with configurable weights   │
-│  └─ 3 graded tasks: dose escalation, allometric          │
-│     scaling, combination DDI scheduling                  │
-└──────────────────────┬──────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│  Layer 5: FastAPI Server + Docker + HF Spaces             │
-│  ├─ REST: /reset, /step, /state, /schema, /drug, /tasks  │
-│  ├─ WebSocket: /ws (persistent sessions)                 │
-│  └─ /drug endpoint: SMILES → full Layer 1+2 pipeline     │
-└──────────────────────┬──────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│  Layer 6: LLM Inference Agent                             │
-│  ├─ Qwen/Qwen2.5-72B-Instruct via HuggingFace router    │
-│  ├─ Drug-aware fragility profiling from ADMET             │
-│  ├─ Task-specific escalation policies                    │
-│  └─ Rule-based fallback on API failure                   │
-└──────────────────────────────────────────────────────────┘
-```
+![RxGym Architecture](architecture.jpeg)
+
+The architecture diagram above shows how RxGym connects six distinct layers into a single end-to-end pipeline. It starts at the top with a raw **SMILES string** — the standard text representation of a molecule — and flows downward through each layer:
+
+- **Layer 1 (Cheminformatics)** computes 14 molecular descriptors via RDKit and predicts ADMET properties (oral bioavailability, CYP inhibition, toxicity flags) using DeepChem's GraphConv models with a QSAR fallback.
+- **Layer 2 (Physiological PK/PD Engine)** translates those molecular properties into pharmacokinetic parameters using allometric scaling across 5 species (mouse → rat → monkey → dog → human), solves a 2-compartment ODE for drug concentration dynamics, and models CYP450-mediated drug-drug interactions following the FDA M12 guidance.
+- **Layer 3 (Multi-Agent Biological Simulation)** spawns a population of virtual patients, each with individual variability. Inside every patient, four sub-agents — HepatocyteAgent (liver stress), ImmuneAgent (cytokine response), RenalAgent (kidney function), and a DoctorAgent (LLM-powered clinical reasoning) — observe the physiological state and emit structured signals.
+- **Layer 4 (RL Environment + FDA Safety Wrapper)** wraps everything into a Gymnasium-compliant interface. An irremovable FDA safety layer enforces hard stopping rules (DLT thresholds, forced de-escalation) that override the agent's actions. The multi-objective reward scores each step on safety, progress, stopping quality, and organ health.
+- **Layer 5 (FastAPI Server + Docker + HF Spaces)** exposes the environment as a production-ready REST and WebSocket API. The `/drug` endpoint accepts any SMILES string and runs the full Layer 1+2 pipeline to configure a molecule-specific trial.
+- **Layer 6 (LLM Inference Agent)** drives the trial decisions using Qwen 72B via HuggingFace, with drug-aware fragility profiling from ADMET predictions and task-specific escalation policies.
+
+Each layer feeds its output directly into the next — molecular descriptors become PK parameters, PK parameters drive patient simulations, patient signals shape rewards, and rewards train the agent. Nothing is hardcoded; everything traces back to the input molecule.
+
 
 ---
 
