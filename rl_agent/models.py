@@ -16,7 +16,7 @@ class RlAgentAction(Action):
     The AI agent fills this in at every step.
     """
     next_dose: float = Field(
-        ...,
+        default=1.0,
         description="Next dose to give patients, in mg per kg of body weight"
     )
     cohort_size: int = Field(
@@ -28,19 +28,19 @@ class RlAgentAction(Action):
         description="True = increase dose next step, False = hold or stop"
     )
     drug_name: Optional[str] = Field(
-        default=_DEFAULT_DRUG_NAME or None,
+        default=_DEFAULT_DRUG_NAME or "Acetaminophen",
         description="Optional drug label for UI-driven configuration. Leave unchanged to keep the current drug."
     )
     drug_smiles: Optional[str] = Field(
-        default=_DEFAULT_DRUG_SMILES or None,
+        default=_DEFAULT_DRUG_SMILES or "CC(=O)NC1=CC=C(O)C=C1",
         description="Optional SMILES string for configuring the molecule directly from the OpenEnv UI."
     )
     source_species: Optional[str] = Field(
-        default=_DEFAULT_SOURCE_SPECIES,
+        default=_DEFAULT_SOURCE_SPECIES or "rat",
         description="Optional preclinical source species used for allometric scaling."
     )
     animal_dose_mgkg: Optional[float] = Field(
-        default=_DEFAULT_ANIMAL_DOSE_MGKG,
+        default=_DEFAULT_ANIMAL_DOSE_MGKG or 10.0,
         description="Optional preclinical dose in mg/kg used to derive the human equivalent dose."
     )
 

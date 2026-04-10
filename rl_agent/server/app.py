@@ -216,6 +216,27 @@ def list_tasks():
         "tasks": tasks,
     }
 
+# ── Mount Gradio dashboard for visual evaluation ──────────────────────────
+try:
+    from .dashboard import create_dashboard
+except ImportError:
+    from rl_agent.server.dashboard import create_dashboard
+
+try:
+    import gradio as gr
+    _dashboard = create_dashboard()
+    app = gr.mount_gradio_app(app, _dashboard, path="/dashboard")
+except Exception:
+    pass  # Gradio optional — API still works without it
+
+
+@app.get("/")
+def root_redirect():
+    """Redirect root to the visual dashboard."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/dashboard")
+
+
 def main(host: str = "0.0.0.0", port: int = 8000):
     """
     Entry point for direct execution via uv run or python -m.

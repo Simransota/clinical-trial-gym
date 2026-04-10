@@ -229,6 +229,97 @@ docker run --rm -p 8000:8000 rxgym
 
 ---
 
+## Live Demo
+
+The environment is deployed on Hugging Face Spaces and can be accessed directly:
+
+| Interface | URL | Description |
+|-----------|-----|-------------|
+| **Visual Dashboard** | [simransota-clinical-trial-env.hf.space/dashboard](https://simransota-clinical-trial-env.hf.space/dashboard) | Gradio UI with preset drugs, one-click trial simulation, and 6-panel visualizations |
+| **OpenEnv Playground** | [simransota-clinical-trial-env.hf.space](https://simransota-clinical-trial-env.hf.space/) | Interactive API playground — type actions, see observations, step through a trial |
+| **API Endpoints** | [simransota-clinical-trial-env.hf.space/docs](https://simransota-clinical-trial-env.hf.space/docs) | Swagger/OpenAPI documentation for all REST endpoints |
+
+### For Evaluators
+
+The fastest way to evaluate RxGym:
+
+1. Open the **[Visual Dashboard](https://simransota-clinical-trial-env.hf.space/dashboard)**
+2. Select a preset drug from the dropdown (Acetaminophen, Naproxen, Diazepam, Aspirin, or Ibuprofen) — or choose **"Custom"** and enter any SMILES string
+3. Click **"Run Trial Simulation"**
+4. Explore the 6 visualization panels and the episode summary
+
+No setup, no API keys, no Docker — just click and explore.
+
+---
+
+## Trial Visualizations
+
+The Gradio dashboard generates six clinical visualization panels after each simulated trial. Each panel provides a different lens into the trial dynamics, mirroring the data a real clinical pharmacologist would review.
+
+### 1. Dose Escalation Trajectory
+
+Tracks the dose (mg/kg) at each trial step. Each point is color-coded by safety status:
+
+- **Green** — no DLTs observed, safe to escalate
+- **Amber** — DLTs detected but below the FDA stopping threshold
+- **Red** — FDA boundary reached (>33% DLT rate)
+
+A dashed green line marks the **RP2D estimate** (Recommended Phase II Dose) — the highest dose that didn't trigger a safety stop. The ideal trial shows a controlled staircase that plateaus near the RP2D line.
+
+### 2. PK Concentration-Time Curves
+
+Displays the full 24-hour pharmacokinetic profile for every patient in every cohort. Each step gets a distinct shade (light → dark blue as dose escalates). The curves show:
+
+- **Absorption phase** — drug entering the bloodstream (rising limb)
+- **Distribution/elimination** — drug clearing via hepatic metabolism and renal excretion (falling limb)
+- **Peak Cmax** — marked with a red dashed line at the highest concentration observed across all patients
+
+These curves are generated from the 2-compartment ODE (with per-patient inter-individual variability), so different patients at the same dose produce slightly different profiles — exactly as in a real clinical trial.
+
+### 3. DLT Grade Heatmap
+
+A step-by-patient matrix showing the **NCI CTCAE toxicity grade** for each patient:
+
+| Grade | Meaning | Color |
+|-------|---------|-------|
+| 0 | No toxicity | Green |
+| 1 | Mild | Light green |
+| 2 | Moderate | Amber |
+| 3 | Severe (**DLT**) | Red |
+| 4 | Life-threatening (**DLT**) | Dark red |
+
+Grades 3+ are **Dose-Limiting Toxicities** — the critical safety events that determine whether escalation continues or stops. This heatmap lets you see exactly which patients experienced toxicity and at which dose level.
+
+### 4. Organ Safety Signals
+
+Three time-series from the biological sub-agents monitoring organ health throughout the trial:
+
+- **Liver Stress** (orange, HepatocyteAgent) — CYP450 enzyme saturation. Rises as AUC accumulates above the Michaelis-Menten threshold. Values >0.7 indicate dangerous hepatic overload.
+- **Immune Response** (purple, ImmuneAgent) — IL-6 cytokine signal. Triggered when plasma concentration exceeds 5 mg/L. Values approaching 1.0 indicate cytokine storm risk.
+- **Renal Function** (blue, RenalAgent) — GFR fraction. Starts at 1.0 (healthy) and declines as kidney stress accumulates. Values <0.5 indicate significant renal impairment.
+
+A red dashed danger threshold at 0.7 highlights when organ signals enter the critical zone. These signals directly feed into the RL reward function's organ health component (10% weight).
+
+### 5. Reward Trajectory
+
+Dual-axis chart showing:
+
+- **Blue bars** — per-step reward (the 4-component weighted score: 40% safety + 35% progress + 15% stopping + 10% organ health)
+- **Red line** — cumulative reward across the episode
+
+A well-run trial shows increasing step rewards as the agent approaches the target dose, with a possible dip when DLTs are first encountered (the agent should then de-escalate). The cumulative line reveals overall trial quality at a glance.
+
+### 6. Drug & Episode Summary
+
+An HTML panel displaying:
+
+- **PK Parameters** — human-scaled ka, CL, Vc, Vp, PPB (computed from the molecule's SMILES via RDKit + DeepChem + allometric scaling)
+- **Safety Flags** — DILI risk, hERG risk, CYP inhibitions, overall risk score (from the ADMET prediction pipeline)
+- **Episode Metrics** — starting dose, RP2D estimate, total steps taken
+- **Task Scores** — final scores for all three graded tasks (phase_i_dosing, allometric_scaling, combo_ddi)
+
+---
+
 ## Technical References
 
 - **Boxenbaum (1982)** — Interspecies scaling, allometric parameters
